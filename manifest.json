@@ -1,0 +1,19 @@
+{
+  "display_name": "CCPromptManager",
+  "loading_order": 10,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "",
+  "author": "aikohanasaki",
+  "version": "1.0.0",
+  "homePage": "https://github.com/aikohanasaki/SillyTavern-CCPromptManager",
+  "description": "Advanced prompt management extension for SillyTavern providing template management, enhanced UI, and extended prompt capabilities.",
+  "license": "AGPL-3.0",
+  "auto_update": {
+    "source": "github",
+    "whitelist": [
+      "https://github.com/aikohanasaki/SillyTavern-CCPromptManager"
+    ]
+  }
+}
