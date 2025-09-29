@@ -1,6 +1,7 @@
 import { Popup, POPUP_TYPE } from '../../../popup.js';
 import { extension_settings, saveMetadataDebounced, getContext } from '../../../extensions.js';
-import { eventSource, event_types, chat_metadata, name2, systemUserName, neutralCharacterName, characters, power_user } from '../../../../script.js';
+import { eventSource, event_types, chat_metadata, name2, systemUserName, neutralCharacterName, characters } from '../../../../script.js';
+import { power_user } from '../../../power-user.js';
 import { selected_group, groups, editGroup } from '../../../group-chats.js';
 
 const MODULE_NAME = 'CCPM';
