@@ -4,6 +4,11 @@
 
 All notable changes to CCPromptManager will be documented in this file.
 
+## [1.0.1] - 2025-09-30
+
+### Fixed
+- Added `allowVerticalScrolling: true` to all popup dialogs for improved scrollability
+
 ## [1.0.0] - 2025-09-30
 
 ### Beta Release

@@ -1104,7 +1104,8 @@ class PromptTemplateManager {
 				</div>
 			`, POPUP_TYPE.CONFIRM, '', {
 				okButton: 'Apply',
-				cancelButton: 'Skip'
+				cancelButton: 'Skip',
+				allowVerticalScrolling: true
 			});
 
 			const result = await popup.show();
@@ -1168,7 +1169,8 @@ class PromptTemplateManager {
 				</div>
 			`, POPUP_TYPE.CONFIRM, '', {
 				okButton: 'Apply',
-				cancelButton: 'Skip'
+				cancelButton: 'Skip',
+				allowVerticalScrolling: true
 			});
 
 			const result = await popup.show();
@@ -1312,6 +1314,7 @@ class PromptTemplateManager {
 			const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
 				okButton: 'Apply',
 				cancelButton: 'Skip',
+				allowVerticalScrolling: true
 			});
 
 			const result = await popup.show();
@@ -1483,6 +1486,7 @@ function openPromptTemplateManagerModal() {
 		cancelButton: 'Close',
 		wide: true,
 		large: true,
+		allowVerticalScrolling: true,
 		onOpen: () => {
 			renderPromptTemplateList();
 			setupTemplateManagerEvents();
@@ -1639,6 +1643,7 @@ window.ccpmDeleteTemplate = async function(id) {
 	const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
 		okButton: 'Delete',
 		cancelButton: 'Cancel',
+		allowVerticalScrolling: true
 	});
 
 	const result = await popup.show();
@@ -1759,7 +1764,8 @@ window.ccpmShowLockMenu = async function(templateId) {
 	const popup = new Popup(content, POPUP_TYPE.TEXT, '', {
 		okButton: false,
 		cancelButton: 'Close',
-		wide: true
+		wide: true,
+		allowVerticalScrolling: true
 	});
 	popup.show();
 };
@@ -1924,6 +1930,7 @@ ${escapeHtml(prompt.content || '(empty)')}
 		cancelButton: 'Close',
 		wide: true,
 		large: true,
+		allowVerticalScrolling: true,
 		onOpen: () => {
 			// Setup click handlers for expanding/collapsing prompts using inline-drawer
 			document.querySelectorAll('.ccpm-expand-prompt').forEach(link => {
@@ -2022,6 +2029,7 @@ window.ccpmEditPromptInTemplate = async function(templateId, promptIdentifier) {
 		cancelButton: 'Cancel',
 		wide: true,
 		large: true,
+		allowVerticalScrolling: true,
 		onOpen: () => {
 			// Re-populate after clone (DOM elements are new)
 			const clonedNameField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_name');
@@ -2149,6 +2157,7 @@ async function showCreateTemplateDialog() {
 	const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
 		okButton: 'Create',
 		cancelButton: 'Cancel',
+		allowVerticalScrolling: true,
 		onClosing: (popup) => {
 			// Capture values before popup closes and DOM is removed
 			if (popup.result === POPUP_RESULT.AFFIRMATIVE) {
@@ -2223,6 +2232,7 @@ async function showEditTemplateDialog(template) {
 	const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
 		okButton: 'Save',
 		cancelButton: 'Cancel',
+		allowVerticalScrolling: true,
 		onClosing: (popup) => {
 			if (popup.result === POPUP_RESULT.AFFIRMATIVE) {
 				const name = document.getElementById('ccpm-edit-name')?.value.trim();
