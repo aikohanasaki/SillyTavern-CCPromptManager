@@ -1522,6 +1522,10 @@ function openPromptTemplateManagerModal() {
 			renderPromptTemplateList();
 			setupTemplateManagerEvents();
 		},
+		onClosing: () => {
+			ccpmMainPopup = null; // Clear reference when popup closes
+			return true;
+		},
 	});
 	ccpmMainPopup.show();
 }
@@ -1636,9 +1640,9 @@ let ccpmMainPopup = null;
 window.ccpmApplyTemplate = async function(id) {
 	if (await promptTemplateManager.applyTemplate(id)) {
 		toastr.success('Template applied successfully!');
-		// Close the main popup
-		if (ccpmMainPopup?.dlg) {
-			ccpmMainPopup.dlg.close();
+		// Close the main popup properly using complete() to trigger proper cleanup
+		if (ccpmMainPopup) {
+			await ccpmMainPopup.completeAffirmative();
 		}
 	} else {
 		toastr.error('Failed to apply template');
