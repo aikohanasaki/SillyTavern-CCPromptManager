@@ -4,6 +4,7 @@ import { eventSource, event_types, chat_metadata, name2, systemUserName, neutral
 import { power_user } from '../../../power-user.js';
 import { oai_settings, promptManager } from '../../../openai.js';
 import { selected_group, groups, editGroup } from '../../../group-chats.js';
+import { escapeHtml } from '../../../utils.js';
 
 const MODULE_NAME = 'CCPM';
 const CACHE_TTL = 1000;
@@ -18,6 +19,12 @@ const SETTING_SOURCES = {
     CHAT: 'chat',
     GROUP: 'group',
     GROUP_CHAT: 'group chat'
+};
+
+const AUTO_APPLY_MODES = {
+    NEVER: 'never',
+    ASK: 'ask',
+    ALWAYS: 'always'
 };
 
 // Utility functions
@@ -392,22 +399,39 @@ class TemplateLockResolver {
     }
 
     _resolveGroupLocks(context, locks) {
+        const prefs = this.extensionSettings;
         const { group, chat, character } = locks;
 
-        // Priority: group -> group chat -> character (individual)
-        if (group) return { templateId: group, source: SETTING_SOURCES.GROUP };
-        if (chat) return { templateId: chat, source: SETTING_SOURCES.GROUP_CHAT };
-        if (character) return { templateId: character, source: SETTING_SOURCES.CHARACTER };
+        // Use user-defined priorities for group chats
+        if (prefs.preferIndividualCharacterInGroup && character) {
+            return { templateId: character, source: SETTING_SOURCES.CHARACTER };
+        }
+
+        if (prefs.preferGroupOverChat) {
+            if (group) return { templateId: group, source: SETTING_SOURCES.GROUP };
+            if (chat) return { templateId: chat, source: `${SETTING_SOURCES.GROUP_CHAT} (fallback)` };
+            if (character) return { templateId: character, source: `${SETTING_SOURCES.CHARACTER} (fallback)` };
+        } else {
+            if (chat) return { templateId: chat, source: SETTING_SOURCES.GROUP_CHAT };
+            if (group) return { templateId: group, source: `${SETTING_SOURCES.GROUP} (fallback)` };
+            if (character) return { templateId: character, source: `${SETTING_SOURCES.CHARACTER} (fallback)` };
+        }
 
         return { templateId: null, source: 'none' };
     }
 
     _resolveSingleLocks(context, locks) {
+        const prefs = this.extensionSettings;
         const { character, chat } = locks;
 
-        // Priority: character -> chat
-        if (character) return { templateId: character, source: SETTING_SOURCES.CHARACTER };
-        if (chat) return { templateId: chat, source: SETTING_SOURCES.CHAT };
+        // Use user-defined priority for single chats
+        if (prefs.preferCharacterOverChat) {
+            if (character) return { templateId: character, source: SETTING_SOURCES.CHARACTER };
+            if (chat) return { templateId: chat, source: `${SETTING_SOURCES.CHAT} (fallback)` };
+        } else {
+            if (chat) return { templateId: chat, source: SETTING_SOURCES.CHAT };
+            if (character) return { templateId: character, source: `${SETTING_SOURCES.CHARACTER} (fallback)` };
+        }
 
         return { templateId: null, source: 'none' };
     }
@@ -473,7 +497,9 @@ class TemplateLockManager {
 
     async getLockToApply() {
         const context = this.chatContext.getCurrent();
-        this.lockResolver = new TemplateLockResolver(this.storage.getExtensionSettings());
+        // Pass extension settings to resolver for priority preferences
+        const settings = this.storage.getExtensionSettings();
+        this.lockResolver = new TemplateLockResolver(settings);
         return this.lockResolver.resolve(context, this.currentLocks);
     }
 
@@ -644,14 +670,36 @@ class PromptTemplateManager {
 		const defaultSettings = {
 			templates: {},
 			templateLocks: {},
-			autoApplyLocked: 'auto',  // 'auto', 'ask', or 'never'
-			lockPriority: 'character', // Default lock priority: character > chat > group
+			autoApplyMode: AUTO_APPLY_MODES.ASK,  // 'never', 'ask', or 'always'
+			// Priority preferences for single chat (character vs chat)
+			preferCharacterOverChat: true,
+			// Priority preferences for group chat (group vs chat vs character)
+			preferGroupOverChat: true,
+			preferIndividualCharacterInGroup: false,
 			version: '1.0.0'
 		};
 
 		if (!extension_settings.ccPromptManager) {
 			extension_settings.ccPromptManager = defaultSettings;
 			// Don't save during initialization - SillyTavern will handle persistence
+		}
+
+		// Ensure all settings exist
+		if (extension_settings.ccPromptManager.preferCharacterOverChat === undefined) {
+			extension_settings.ccPromptManager.preferCharacterOverChat = true;
+		}
+		if (extension_settings.ccPromptManager.preferGroupOverChat === undefined) {
+			extension_settings.ccPromptManager.preferGroupOverChat = true;
+		}
+		if (extension_settings.ccPromptManager.preferIndividualCharacterInGroup === undefined) {
+			extension_settings.ccPromptManager.preferIndividualCharacterInGroup = false;
+		}
+
+		// Migrate old setting if it exists
+		if (extension_settings.ccPromptManager.autoApplyLocked && !extension_settings.ccPromptManager.autoApplyMode) {
+			const oldValue = extension_settings.ccPromptManager.autoApplyLocked;
+			extension_settings.ccPromptManager.autoApplyMode = oldValue === 'auto' ? AUTO_APPLY_MODES.ALWAYS : oldValue === 'ask' ? AUTO_APPLY_MODES.ASK : AUTO_APPLY_MODES.NEVER;
+			delete extension_settings.ccPromptManager.autoApplyLocked;
 		}
 	}
 
@@ -951,6 +999,13 @@ class PromptTemplateManager {
 			this.handleSettingsUpdate();
 		});
 
+		// Listen for preset changes to potentially reapply locked templates
+		if (event_types.PRESET_CHANGED) {
+			eventSource.on(event_types.PRESET_CHANGED, () => {
+				this.handlePresetChange();
+			});
+		}
+
 		// Listen for character changes to potentially auto-apply templates
 		eventSource.on(event_types.CHAT_CHANGED, () => {
 			this.handleChatChange();
@@ -1010,10 +1065,59 @@ class PromptTemplateManager {
 	}
 
 	// Handle settings update event
-	handleSettingsUpdate() {
+	async handleSettingsUpdate() {
 		// Reload templates if extension settings changed externally
 		if (extension_settings.ccPromptManager) {
 			this.loadTemplatesFromSettings();
+		}
+	}
+
+	async handlePresetChange() {
+		const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
+
+		if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
+			console.log('CCPM: Auto-apply disabled, skipping template reapplication');
+			return;
+		}
+
+		const effectiveLock = await this.getEffectiveLock();
+		if (!effectiveLock || !effectiveLock.templateId) {
+			console.log('CCPM: No locked template, skipping auto-apply');
+			return;
+		}
+
+		if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
+			const context = this.lockManager.chatContext.getCurrent();
+			const template = this.getTemplate(effectiveLock.templateId);
+			if (!template) return;
+
+			const contextType = context.isGroupChat ? 'group chat' : 'character';
+			const sourceName = context.isGroupChat ?
+				(context.groupName || 'Unnamed Group') :
+				(context.characterName || 'Unknown Character');
+
+			const popup = new Popup(`
+				<div class="flex-container flexFlowColumn flexGap10">
+					<h4>Preset Changed</h4>
+					<p>Reapply locked template "<strong>${escapeHtml(template.name)}</strong>" for ${contextType} "${escapeHtml(sourceName)}"?</p>
+					<p class="text_muted fontsize90p">This will restore the locked prompt configuration.</p>
+				</div>
+			`, POPUP_TYPE.CONFIRM, '', {
+				okButton: 'Apply',
+				cancelButton: 'Skip'
+			});
+
+			const result = await popup.show();
+			if (result === POPUP_RESULT.AFFIRMATIVE) {
+				await this.applyTemplate(effectiveLock.templateId);
+				toastr.success(`Reapplied template: ${template.name}`);
+			}
+		} else if (autoApplyMode === AUTO_APPLY_MODES.ALWAYS) {
+			const template = this.getTemplate(effectiveLock.templateId);
+			if (template) {
+				await this.applyTemplate(effectiveLock.templateId);
+				toastr.info(`Auto-reapplied template: ${template.name}`);
+			}
 		}
 	}
 
@@ -1023,31 +1127,59 @@ class PromptTemplateManager {
 	async handleChatChange() {
 		console.log('CCPM: Chat changed, templates available:', this.templates.size);
 
-		// Load current locks and apply locked template based on setting
+		// Invalidate context cache
+		this.lockManager.chatContext.invalidate();
+
+		// Load current locks
 		await this.lockManager.loadCurrentLocks();
 
-		const settings = this.storage.getExtensionSettings();
-		const autoApplyMode = settings.autoApplyLocked || 'auto'; // Handle legacy boolean values
+		// Apply locked template based on auto-apply mode
+		const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
 
-		switch (autoApplyMode) {
-			case 'auto':
-			case true: // Legacy compatibility
-				await this.applyLockedTemplate();
-				break;
-			case 'ask':
-				await this.askToApplyLockedTemplate();
-				break;
-			case 'never':
-			case false: // Legacy compatibility
-				// Do nothing
-				break;
-			default:
-				console.warn('CCPM: Unknown autoApplyLocked mode:', autoApplyMode);
-				break;
+		if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
+			console.log('CCPM: Auto-apply disabled on chat change');
+			return;
 		}
 
-		// Trigger context change for lock manager
-		this.lockManager.onContextChanged();
+		const effectiveLock = await this.getEffectiveLock();
+		if (!effectiveLock || !effectiveLock.templateId) {
+			console.log('CCPM: No locked template for this chat');
+			return;
+		}
+
+		const template = this.getTemplate(effectiveLock.templateId);
+		if (!template) {
+			console.warn('CCPM: Locked template not found:', effectiveLock.templateId);
+			return;
+		}
+
+		if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
+			const context = this.lockManager.chatContext.getCurrent();
+			const contextType = context.isGroupChat ? 'group chat' : 'character';
+			const sourceName = context.isGroupChat ?
+				(context.groupName || 'Unnamed Group') :
+				(context.characterName || 'Unknown Character');
+
+			const popup = new Popup(`
+				<div class="flex-container flexFlowColumn flexGap10">
+					<h4>Chat Changed</h4>
+					<p>Apply locked template "<strong>${escapeHtml(template.name)}</strong>" for ${contextType} "${escapeHtml(sourceName)}"?</p>
+					<p class="text_muted fontsize90p">Source: ${effectiveLock.source}</p>
+				</div>
+			`, POPUP_TYPE.CONFIRM, '', {
+				okButton: 'Apply',
+				cancelButton: 'Skip'
+			});
+
+			const result = await popup.show();
+			if (result === POPUP_RESULT.AFFIRMATIVE) {
+				await this.applyTemplate(effectiveLock.templateId);
+				toastr.success(`Applied template: ${template.name}`);
+			}
+		} else if (autoApplyMode === AUTO_APPLY_MODES.ALWAYS) {
+			await this.applyTemplate(effectiveLock.templateId);
+			toastr.info(`Auto-applied template: ${template.name}`);
+		}
 	}
 
 	/**
@@ -1420,10 +1552,13 @@ async function renderPromptTemplateList() {
 						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmApplyTemplate('${t.id}')" title="Apply Template" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-play"></i>
 						</div>
+						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmViewPrompts('${t.id}')" title="View/Edit Prompts" style="width: 32px; height: 32px; padding: 0;">
+							<i class="fa-solid fa-pencil"></i>
+						</div>
 						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmShowLockMenu('${t.id}')" title="Lock/Unlock Template" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-lock"></i>
 						</div>
-						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmEditTemplate('${t.id}')" title="Edit Template" style="width: 32px; height: 32px; padding: 0;">
+						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmEditTemplate('${t.id}')" title="Edit Template Name/Description" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-edit"></i>
 						</div>
 						<div class="menu_button menu_button_icon interactable redOverlayGlow" onclick="window.ccpmDeleteTemplate('${t.id}')" title="Delete Template" style="width: 32px; height: 32px; padding: 0;">
@@ -1442,11 +1577,7 @@ async function renderPromptTemplateList() {
 	}).join('');
 }
 
-function escapeHtml(text) {
-	const div = document.createElement('div');
-	div.textContent = text;
-	return div.innerHTML;
-}
+// escapeHtml is now imported from ST's utils.js
 
 function setupTemplateManagerEvents() {
 	// Setup toolbar events
@@ -1543,6 +1674,11 @@ window.ccpmShowLockMenu = async function(templateId) {
 		availableTargets.push('group');
 	}
 
+	const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
+	const preferCharacterOverChat = extension_settings.ccPromptManager?.preferCharacterOverChat ?? true;
+	const preferGroupOverChat = extension_settings.ccPromptManager?.preferGroupOverChat ?? true;
+	const preferIndividualCharacterInGroup = extension_settings.ccPromptManager?.preferIndividualCharacterInGroup ?? false;
+
 	const content = document.createElement('div');
 	content.innerHTML = `
 		<div class="flex-container flexFlowColumn flexGap10">
@@ -1556,30 +1692,67 @@ window.ccpmShowLockMenu = async function(templateId) {
 					const contextName = getContextName(context, target);
 
 					return `
-						<div class="text_pole padding10 flex-container spaceBetween alignItemsCenter">
-							<div class="flexGrow">
+						<label class="checkbox_label">
+							<input type="checkbox"
+								id="ccpm-lock-${target}"
+								${isCurrentlyLocked ? 'checked' : ''}
+								onchange="if(this.checked) { ccpmLockToTarget('${templateId}', '${target}'); } else { ccpmClearLock('${target}'); }">
+							<span>
 								<strong>${target.charAt(0).toUpperCase() + target.slice(1)}</strong>
-								${contextName ? `<br><small class="text_muted">${contextName}</small>` : ''}
-								${isCurrentlyLocked ? '<br><span class="toggleEnabled fontsize90p">🔒 Currently locked</span>' : ''}
-								${hasOtherLock ? '<br><span class="text_danger fontsize90p">⚠️ Another template is locked</span>' : ''}
-							</div>
-							<div>
-								${!isCurrentlyLocked ? `
-									<button class="menu_button interactable" onclick="ccpmLockToTarget('${templateId}', '${target}')">
-										Lock Here
-									</button>
-								` : `
-									<button class="menu_button interactable redOverlayGlow" onclick="ccpmClearLock('${target}')">
-										Unlock
-									</button>
-								`}
-							</div>
-						</div>
+								${contextName ? ` - <small class="text_muted">${escapeHtml(contextName)}</small>` : ''}
+								${hasOtherLock ? '<br><small class="text_danger">⚠️ Another template is locked</small>' : ''}
+							</span>
+						</label>
 					`;
 				}).join('')}
 			</div>
 
 			${availableTargets.length === 0 ? '<p class="text_muted">No lock targets available in current context.</p>' : ''}
+
+			<hr>
+
+			<div class="completion_prompt_manager_popup_entry_form_control">
+				<h4>⚙️ Auto-apply when preset changes:</h4>
+				<div class="marginTop10">
+					<label class="radio_label">
+						<input type="radio" name="ccpm-auto-apply-mode" value="${AUTO_APPLY_MODES.NEVER}" ${autoApplyMode === AUTO_APPLY_MODES.NEVER ? 'checked' : ''} onchange="window.ccpmSetAutoApplyMode('${AUTO_APPLY_MODES.NEVER}')">
+						<span>Never - Don't reapply locked templates</span>
+					</label>
+					<label class="radio_label">
+						<input type="radio" name="ccpm-auto-apply-mode" value="${AUTO_APPLY_MODES.ASK}" ${autoApplyMode === AUTO_APPLY_MODES.ASK ? 'checked' : ''} onchange="window.ccpmSetAutoApplyMode('${AUTO_APPLY_MODES.ASK}')">
+						<span>Ask - Prompt before applying locked templates</span>
+					</label>
+					<label class="radio_label">
+						<input type="radio" name="ccpm-auto-apply-mode" value="${AUTO_APPLY_MODES.ALWAYS}" ${autoApplyMode === AUTO_APPLY_MODES.ALWAYS ? 'checked' : ''} onchange="window.ccpmSetAutoApplyMode('${AUTO_APPLY_MODES.ALWAYS}')">
+						<span>Always - Automatically apply locked templates</span>
+					</label>
+				</div>
+			</div>
+
+			<hr>
+
+			<div class="completion_prompt_manager_popup_entry_form_control">
+				<h4>⚙️ Lock Priority:</h4>
+				${context.isGroupChat ? `
+					<div class="marginTop10">
+						<label class="checkbox_label">
+							<input type="checkbox" id="ccpm-pref-group-over-chat" ${preferGroupOverChat ? 'checked' : ''} onchange="window.ccpmSetPriority('preferGroupOverChat', this.checked)">
+							<span>Prefer group settings over chat</span>
+						</label>
+						<label class="checkbox_label">
+							<input type="checkbox" id="ccpm-pref-individual-char" ${preferIndividualCharacterInGroup ? 'checked' : ''} onchange="window.ccpmSetPriority('preferIndividualCharacterInGroup', this.checked)">
+							<span>Prefer character settings over group or chat</span>
+						</label>
+					</div>
+				` : `
+					<div class="marginTop10">
+						<label class="checkbox_label">
+							<input type="checkbox" id="ccpm-pref-char-over-chat" ${preferCharacterOverChat ? 'checked' : ''} onchange="window.ccpmSetPriority('preferCharacterOverChat', this.checked)">
+							<span>Prefer character settings over chat</span>
+						</label>
+					</div>
+				`}
+			</div>
 		</div>
 	`;
 
@@ -1623,6 +1796,313 @@ window.ccpmClearLock = async function(target) {
 		// The lock menu popup will close itself via its cancelButton
 		// Just refresh the template list in the main popup
 		await renderPromptTemplateList();
+	}
+};
+
+window.ccpmSetAutoApplyMode = function(mode) {
+	extension_settings.ccPromptManager.autoApplyMode = mode;
+	saveSettingsDebounced();
+	console.log('CCPM: Auto-apply mode set to:', mode);
+};
+
+window.ccpmSetPriority = function(preference, value) {
+	extension_settings.ccPromptManager[preference] = value;
+	saveSettingsDebounced();
+	console.log('CCPM: Priority preference set:', preference, '=', value);
+};
+
+window.ccpmViewPrompts = async function(templateId) {
+	const template = promptTemplateManager.getTemplate(templateId);
+	if (!template) {
+		toastr.error('Template not found');
+		return;
+	}
+
+	// Build list ordered by promptOrder if available - include markers for reordering
+	let orderedPrompts = [];
+	if (template.promptOrder && Array.isArray(template.promptOrder) && template.promptOrder.length > 0) {
+		// Use promptOrder to determine sequence, include all prompts (including markers)
+		orderedPrompts = template.promptOrder
+			.map(entry => template.prompts[entry.identifier])
+			.filter(prompt => prompt); // Filter out nulls only
+	} else {
+		// Fallback to all prompts including markers
+		orderedPrompts = Object.values(template.prompts);
+	}
+
+	if (orderedPrompts.length === 0) {
+		toastr.info('This template contains no prompts');
+		return;
+	}
+
+	const content = document.createElement('div');
+	content.innerHTML = `
+		<div class="flex-container flexFlowColumn" style="gap: 10px;">
+			<div class="title_restorable">
+				<h3>${escapeHtml(template.name)}</h3>
+			</div>
+			${template.description ? `<div class="text_muted">${escapeHtml(template.description)}</div>` : ''}
+
+			<ul id="ccpm-prompt-order-list" class="text_pole" style="list-style: none; padding: 0; margin: 0; max-height: 60vh; overflow-y: auto;">
+				<li class="ccpm_prompt_manager_list_head">
+					<span>Name</span>
+					<span></span>
+					<span>Role</span>
+				</li>
+				<li class="ccpm_prompt_manager_list_separator">
+					<hr>
+				</li>
+				${orderedPrompts.map(prompt => {
+					const isMarker = prompt.marker;
+					const isSystemPrompt = prompt.system_prompt;
+					const isInjectionPrompt = prompt.injection_position === 1;
+					const promptRoles = {
+						assistant: { roleIcon: 'fa-robot', roleTitle: 'Prompt will be sent as Assistant' },
+						user: { roleIcon: 'fa-user', roleTitle: 'Prompt will be sent as User' },
+					};
+					const iconLookup = prompt.role === 'system' && prompt.system_prompt ? '' : prompt.role;
+					const roleIcon = promptRoles[iconLookup]?.roleIcon || '';
+					const roleTitle = promptRoles[iconLookup]?.roleTitle || '';
+
+					// Markers show name but are not expandable or editable
+					const nameDisplay = isMarker
+						? `<span title="${escapeHtml(prompt.name || prompt.identifier)}">${escapeHtml(prompt.name || prompt.identifier)}</span>`
+						: `<a class="ccpm-expand-prompt" data-identifier="${escapeHtml(prompt.identifier)}">${escapeHtml(prompt.name || prompt.identifier)}</a>`;
+
+					// Edit button only for non-markers
+					const editButton = !isMarker
+						? `<span class="ccpm-edit-prompt fa-solid fa-pencil fa-xs" data-identifier="${escapeHtml(prompt.identifier)}" title="Edit prompt" style="margin-left: 8px; opacity: 0.4; cursor: pointer;"></span>`
+						: '';
+
+					return `
+						<li class="ccpm_prompt_manager_prompt ccpm_prompt_draggable ${isMarker ? 'ccpm_prompt_manager_marker' : ''}" data-identifier="${escapeHtml(prompt.identifier)}">
+							<span class="drag-handle">☰</span>
+							<span class="ccpm_prompt_manager_prompt_name">
+								${isMarker ? '<span class="fa-fw fa-solid fa-thumb-tack" title="Marker"></span>' : ''}
+								${!isMarker && isSystemPrompt ? '<span class="fa-fw fa-solid fa-square-poll-horizontal" title="System Prompt"></span>' : ''}
+								${!isMarker && !isSystemPrompt ? '<span class="fa-fw fa-solid fa-asterisk" title="User Prompt"></span>' : ''}
+								${isInjectionPrompt ? '<span class="fa-fw fa-solid fa-syringe" title="In-Chat Injection"></span>' : ''}
+								${nameDisplay}
+								${editButton}
+								${roleIcon ? `<span data-role="${escapeHtml(prompt.role)}" class="fa-xs fa-solid ${roleIcon}" title="${roleTitle}"></span>` : ''}
+								${isInjectionPrompt ? `<small class="prompt-manager-injection-depth">@ ${escapeHtml(prompt.injection_depth)}</small>` : ''}
+							</span>
+							<span></span>
+							<span class="ccpm_prompt_role">${escapeHtml(prompt.role || 'system')}</span>
+						</li>
+						${!isMarker ? `
+							<li class="inline-drawer ccpm_prompt_drawer" data-identifier="${escapeHtml(prompt.identifier)}" style="grid-column: 1 / -1; margin: 0 0 10px 30px;">
+								<div class="inline-drawer-toggle inline-drawer-header" style="display: none;">
+									<span>Prompt Content</span>
+									<div class="fa-solid fa-circle-chevron-down inline-drawer-icon down"></div>
+								</div>
+								<div class="inline-drawer-content text_pole padding10" style="background: var(--black30a); display: none;">
+									${prompt.injection_position === 1 ? `
+										<div class="flex-container flexGap10 marginBot5 fontsize90p text_muted">
+											<span><strong>Position:</strong> Absolute (In-Chat)</span>
+											<span><strong>Depth:</strong> ${prompt.injection_depth || 4}</span>
+											<span><strong>Order:</strong> ${prompt.injection_order || 100}</span>
+										</div>
+									` : ''}
+									<div class="fontsize90p" style="white-space: pre-wrap; font-family: monospace; max-height: 300px; overflow-y: auto;">
+${escapeHtml(prompt.content || '(empty)')}
+									</div>
+								</div>
+							</li>
+						` : ''}
+					`;
+				}).join('')}
+			</ul>
+			<div class="text_muted fontsize90p">
+				<i class="fa-solid fa-info-circle"></i> Drag prompts by the handle to reorder. Click prompt names to expand/collapse content.
+			</div>
+		</div>
+	`;
+
+	const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
+		okButton: 'Save Order',
+		cancelButton: 'Close',
+		wide: true,
+		large: true,
+		onOpen: () => {
+			// Setup click handlers for expanding/collapsing prompts using inline-drawer
+			document.querySelectorAll('.ccpm-expand-prompt').forEach(link => {
+				link.addEventListener('click', (e) => {
+					e.preventDefault();
+					const identifier = link.dataset.identifier;
+					const drawerContent = document.querySelector(`.ccpm_prompt_drawer[data-identifier="${identifier}"] .inline-drawer-content`);
+					if (drawerContent) {
+						const isVisible = drawerContent.style.display !== 'none';
+						drawerContent.style.display = isVisible ? 'none' : 'block';
+					}
+				});
+			});
+
+			// Setup click handlers for editing prompts
+			document.querySelectorAll('.ccpm-edit-prompt').forEach(btn => {
+				btn.addEventListener('click', (e) => {
+					e.preventDefault();
+					e.stopPropagation();
+					const identifier = btn.dataset.identifier;
+					ccpmEditPromptInTemplate(templateId, identifier);
+				});
+			});
+
+			// Make the list sortable using jQuery UI
+			$('#ccpm-prompt-order-list').sortable({
+				delay: 30,
+				handle: '.drag-handle',
+				items: '.ccpm_prompt_draggable',
+				update: function() {
+					// Order changed - will be saved if user clicks Save
+				}
+			});
+		},
+		onClosing: async (popup) => {
+			if (popup.result === POPUP_RESULT.AFFIRMATIVE) {
+				// Save the new order
+				const newOrder = [];
+				document.querySelectorAll('.ccpm_prompt_draggable').forEach(li => {
+					const identifier = li.dataset.identifier;
+					// Find the original entry in promptOrder to preserve enabled status
+					const originalEntry = template.promptOrder?.find(e => e.identifier === identifier);
+					newOrder.push({
+						identifier: identifier,
+						enabled: originalEntry?.enabled ?? true
+					});
+				});
+
+				// Update template's promptOrder
+				promptTemplateManager.updateTemplate(templateId, {
+					promptOrder: newOrder
+				});
+
+				toastr.success('Prompt order saved');
+				return true;
+			}
+			return true;
+		}
+	});
+
+	await popup.show();
+};
+
+/**
+ * Edit a prompt within a template using ST's existing edit form
+ */
+window.ccpmEditPromptInTemplate = async function(templateId, promptIdentifier) {
+	const template = promptTemplateManager.getTemplate(templateId);
+	if (!template) {
+		toastr.error('Template not found');
+		return;
+	}
+
+	const prompt = template.prompts[promptIdentifier];
+	if (!prompt) {
+		toastr.error('Prompt not found in template');
+		return;
+	}
+
+	// Clone ST's existing edit form from the DOM
+	const formContainer = document.getElementById('completion_prompt_manager_popup_edit');
+	if (!formContainer) {
+		toastr.error('Edit form container not found');
+		return;
+	}
+
+	// Clone ST's form to use in our popup
+	const clonedForm = formContainer.cloneNode(true);
+	clonedForm.id = 'ccpm_temp_edit_form';
+	clonedForm.style.display = 'block';
+
+	let savedData = null;
+
+	const editPopup = new Popup(clonedForm, POPUP_TYPE.CONFIRM, '', {
+		okButton: 'Save',
+		cancelButton: 'Cancel',
+		wide: true,
+		large: true,
+		onOpen: () => {
+			// Re-populate after clone (DOM elements are new)
+			const clonedNameField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_name');
+			const clonedRoleField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_role');
+			const clonedPromptField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_prompt');
+			const clonedInjectionPositionField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_injection_position');
+			const clonedInjectionDepthField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_injection_depth');
+			const clonedInjectionOrderField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_injection_order');
+			const clonedInjectionTriggerField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_injection_trigger');
+			const clonedDepthBlock = clonedForm.querySelector('#completion_prompt_manager_depth_block');
+			const clonedOrderBlock = clonedForm.querySelector('#completion_prompt_manager_order_block');
+			const clonedForbidOverridesField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_forbid_overrides');
+
+			if (clonedNameField) clonedNameField.value = prompt.name || '';
+			if (clonedRoleField) clonedRoleField.value = prompt.role || 'system';
+			if (clonedPromptField) clonedPromptField.value = prompt.content || '';
+			if (clonedInjectionPositionField) clonedInjectionPositionField.value = (prompt.injection_position ?? 0).toString();
+			if (clonedInjectionDepthField) clonedInjectionDepthField.value = (prompt.injection_depth ?? 4).toString();
+			if (clonedInjectionOrderField) clonedInjectionOrderField.value = (prompt.injection_order ?? 100).toString();
+
+			if (clonedInjectionTriggerField) {
+				Array.from(clonedInjectionTriggerField.options).forEach(option => {
+					option.selected = Array.isArray(prompt.injection_trigger) && prompt.injection_trigger.includes(option.value);
+				});
+			}
+
+			if (clonedDepthBlock && clonedOrderBlock) {
+				const showFields = clonedInjectionPositionField && clonedInjectionPositionField.value === '1';
+				clonedDepthBlock.style.visibility = showFields ? 'visible' : 'hidden';
+				clonedOrderBlock.style.visibility = showFields ? 'visible' : 'hidden';
+
+				// Add change listener for injection position
+				if (clonedInjectionPositionField) {
+					clonedInjectionPositionField.addEventListener('change', (e) => {
+						const showFields = e.target.value === '1';
+						clonedDepthBlock.style.visibility = showFields ? 'visible' : 'hidden';
+						clonedOrderBlock.style.visibility = showFields ? 'visible' : 'hidden';
+					});
+				}
+			}
+
+			if (clonedForbidOverridesField) clonedForbidOverridesField.checked = prompt.forbid_overrides ?? false;
+		},
+		onClosing: (popup) => {
+			if (popup.result === POPUP_RESULT.AFFIRMATIVE) {
+				// Capture form values
+				const clonedNameField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_name');
+				const clonedRoleField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_role');
+				const clonedPromptField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_prompt');
+				const clonedInjectionPositionField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_injection_position');
+				const clonedInjectionDepthField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_injection_depth');
+				const clonedInjectionOrderField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_injection_order');
+				const clonedInjectionTriggerField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_injection_trigger');
+				const clonedForbidOverridesField = clonedForm.querySelector('#completion_prompt_manager_popup_entry_form_forbid_overrides');
+
+				savedData = {
+					name: clonedNameField?.value || prompt.name,
+					role: clonedRoleField?.value || prompt.role,
+					content: clonedPromptField?.value || prompt.content,
+					injection_position: clonedInjectionPositionField ? Number(clonedInjectionPositionField.value) : prompt.injection_position,
+					injection_depth: clonedInjectionDepthField ? Number(clonedInjectionDepthField.value) : prompt.injection_depth,
+					injection_order: clonedInjectionOrderField ? Number(clonedInjectionOrderField.value) : prompt.injection_order,
+					injection_trigger: clonedInjectionTriggerField ? Array.from(clonedInjectionTriggerField.selectedOptions).map(opt => opt.value) : prompt.injection_trigger,
+					forbid_overrides: clonedForbidOverridesField?.checked ?? prompt.forbid_overrides,
+				};
+			}
+			return true;
+		}
+	});
+
+	const result = await editPopup.show();
+
+	if (result && savedData) {
+		// Update the prompt in the template
+		Object.assign(template.prompts[promptIdentifier], savedData);
+		template.updatedAt = new Date().toISOString();
+		promptTemplateManager.saveSettings();
+		toastr.success('Prompt updated in template');
+
+		// Refresh the viewer
+		await window.ccpmViewPrompts(templateId);
 	}
 };
 
