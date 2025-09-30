@@ -4,6 +4,19 @@
 
 All notable changes to CCPromptManager will be documented in this file.
 
+## [1.0.3] - 2025-09-30
+
+### Fixed
+- **Template Creation**: Now correctly captures prompt order from `promptManager.activeCharacter` instead of trying to infer from context, ensuring the displayed order is captured
+- **Template Application**: Fixed full preset replacement to update both `oai_settings.prompts` (content) and `oai_settings.prompt_order` (order) completely
+- **Character ID Handling**: Fixed character ID 0 being treated as falsy, now uses nullish coalescing (`??`) to handle all valid character IDs including 0
+- **Multi-Character Presets**: Added support for presets with multiple character_id entries (e.g., 100000, 100001) by storing and applying the specific `promptOrderCharacterId` from template creation
+
+### Changed
+- Template application now directly replaces `oai_settings.prompts` array instead of using `updatePrompts()` for complete preset replacement behavior
+- Templates now store `promptOrderCharacterId` to preserve which character ID the order was captured from
+- When applying templates, `promptManager.activeCharacter.id` is updated to match the template's character ID for correct UI display
+
 ## [1.0.2] - 2025-09-30
 
 ### Added

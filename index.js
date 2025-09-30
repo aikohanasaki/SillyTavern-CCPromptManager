@@ -875,49 +875,74 @@ class PromptTemplateManager {
 			return false;
 		}
 
+		console.log('CCPM DEBUG: applyTemplate called for:', tmpl.name, 'id:', templateId);
+		console.log('CCPM DEBUG: Template prompt identifiers:', Object.keys(tmpl.prompts));
+
 		try {
 			if (!promptManager) {
 				toastr.error('PromptManager not available');
 				return false;
 			}
 
-			// Convert template's prompts object to array format for ST's updatePrompts
-			const promptUpdates = Object.values(tmpl.prompts);
+			// Log current state BEFORE applying
+			console.log('CCPM DEBUG: Current oai_settings.prompts identifiers BEFORE:', oai_settings.prompts?.map(p => p.identifier) || 'none');
 
-			// Use ST's updatePrompts to apply all prompt changes
-			promptManager.updatePrompts(promptUpdates);
+			// Convert template's prompts object to array format
+			const promptUpdates = Object.values(tmpl.prompts);
+			console.log('CCPM DEBUG: promptUpdates count:', promptUpdates.length);
+			console.log('CCPM DEBUG: promptUpdates identifiers:', promptUpdates.map(p => p.identifier));
+
+			// Replace entire prompts array with template prompts (like preset import)
+			oai_settings.prompts = promptUpdates;
+			console.log('CCPM DEBUG: Replaced oai_settings.prompts array');
+			console.log('CCPM DEBUG: Current oai_settings.prompts identifiers AFTER replacement:', oai_settings.prompts?.map(p => p.identifier) || 'none');
 
 			// Restore prompt order if saved in template
-			// Use ST's pattern from import() method: get existing order and Object.assign
 			if (tmpl.promptOrder && Array.isArray(tmpl.promptOrder) && tmpl.promptOrder.length > 0) {
-				// Get current character context
-				const context = getContext();
-				const currentCharId = context.characterId;
+				// Use the character_id that was stored when the template was created
+				// This ensures we apply to the same character_id (e.g., 100001) that was captured
+				const targetCharacterId = tmpl.promptOrderCharacterId ?? 100000;
+				console.log('CCPM DEBUG: Applying prompt order for character ID:', targetCharacterId);
+				console.log('CCPM DEBUG: Template order length:', tmpl.promptOrder.length);
+				console.log('CCPM DEBUG: Template order:', JSON.stringify(tmpl.promptOrder, null, 2));
 
-				// Determine target character (use current character, or global dummyId 100000 if no character)
-				const character = { id: currentCharId || 100000 };
+				// Check if character already has an order entry
+				const existingOrderEntry = oai_settings.prompt_order?.find(entry => String(entry.character_id) === String(targetCharacterId));
 
-				// Get existing order array and assign new order (mutates in place, preserving reference)
-				const existingOrder = promptManager.getPromptOrderForCharacter(character);
-
-				if (existingOrder.length === 0) {
-					// No existing order, add new one
-					promptManager.addPromptOrderForCharacter(character, tmpl.promptOrder);
+				if (existingOrderEntry) {
+					// Replace existing order
+					console.log('CCPM DEBUG: Replacing existing order for character', targetCharacterId);
+					existingOrderEntry.order = JSON.parse(JSON.stringify(tmpl.promptOrder));
 				} else {
-					// Update existing order in place using ST's pattern
-					Object.assign(existingOrder, tmpl.promptOrder);
+					// Add new order entry for this character
+					console.log('CCPM DEBUG: Adding new order entry for character', targetCharacterId);
+					if (!oai_settings.prompt_order) {
+						oai_settings.prompt_order = [];
+					}
+					oai_settings.prompt_order.push({
+						character_id: targetCharacterId,
+						order: JSON.parse(JSON.stringify(tmpl.promptOrder))
+					});
 				}
 
-				console.log('CCPM: Restored prompt order for character', character.id, ':', tmpl.promptOrder.length, 'items');
+				// Update promptManager's activeCharacter to match the template
+				if (promptManager && promptManager.activeCharacter) {
+					promptManager.activeCharacter.id = targetCharacterId;
+					console.log('CCPM DEBUG: Updated promptManager.activeCharacter.id to', targetCharacterId);
+				}
+
+				console.log('CCPM: Restored prompt order for character', targetCharacterId, ':', tmpl.promptOrder.length, 'items');
+			} else {
+				console.log('CCPM DEBUG: No promptOrder in template or empty array');
 			}
 
 			// Save settings and trigger update using PromptManager's method
+			// Important: Save first, then render (matches ST's pattern)
+			console.log('CCPM DEBUG: Calling promptManager.saveServiceSettings()');
 			await promptManager.saveServiceSettings();
 
-			// Optionally re-render the prompt manager UI if it's open
-			if (typeof promptManager.render === 'function') {
-				await promptManager.render();
-			}
+			console.log('CCPM DEBUG: Calling promptManager.render()');
+			await promptManager.render();
 
 			toastr.success(`Template "${tmpl.name}" applied`);
 			console.log('CCPM: Template applied successfully:', tmpl.name);
@@ -970,15 +995,20 @@ class PromptTemplateManager {
 		const currentCharName = context.name2 || name2;
 		console.log('CCPM DEBUG: Current character - ID:', currentCharId, 'Name:', currentCharName);
 
-		// Use ST's PromptManager to get the order array
-		// For no character or global, use dummyId (100000)
+		// Capture the prompt order that's currently active/displayed
+		// Use promptManager.activeCharacter which reflects what's currently shown in the UI
 		let promptOrderToSave = [];
-		if (promptManager) {
-			const character = currentCharId ? { id: currentCharId } : { id: 100000 };
-			promptOrderToSave = promptManager.getPromptOrderForCharacter(character);
-			console.log('CCPM DEBUG: Retrieved prompt order via PromptManager:', promptOrderToSave.length, 'items');
+		let activeCharacterId = null;
+		if (promptManager && promptManager.activeCharacter) {
+			activeCharacterId = promptManager.activeCharacter.id;
+			console.log('CCPM DEBUG: Using promptManager.activeCharacter:', activeCharacterId);
+			console.log('CCPM DEBUG: Available prompt_order entries:', oai_settings.prompt_order?.map(e => ({ char_id: e.character_id, order_length: e.order?.length })));
+
+			promptOrderToSave = promptManager.getPromptOrderForCharacter(promptManager.activeCharacter);
+			console.log('CCPM DEBUG: Retrieved prompt order:', promptOrderToSave.length, 'items');
+			console.log('CCPM DEBUG: Order identifiers:', promptOrderToSave.map(e => e.identifier));
 		} else {
-			console.warn('CCPM: PromptManager not available, prompt order will not be saved');
+			console.warn('CCPM: PromptManager or activeCharacter not available, prompt order will not be saved');
 		}
 
 		const result = this.createTemplate({
@@ -986,6 +1016,7 @@ class PromptTemplateManager {
 			description,
 			prompts: currentPrompts,
 			promptOrder: promptOrderToSave,
+			promptOrderCharacterId: activeCharacterId,  // Store which character_id this order is for
 			characterName: currentCharName
 		});
 		console.log('CCPM DEBUG: createTemplate returned:', result);
