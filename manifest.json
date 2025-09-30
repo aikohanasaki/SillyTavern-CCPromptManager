@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "aikohanasaki",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "homePage": "https://github.com/aikohanasaki/SillyTavern-CCPromptManager",
   "description": "Advanced prompt template management for SillyTavern. Create, save, and lock prompt configurations per character, chat, or group. Features template library, hierarchical locking, auto-apply on preset/character changes, and full prompt editing.",
   "license": "AGPL-3.0",

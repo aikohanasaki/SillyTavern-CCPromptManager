@@ -2140,6 +2140,10 @@ async function showCreateTemplateDialog() {
 			</div>
 			<div class="flex-container flexFlowColumn">
 				<label><strong>Include Prompts:</strong></label>
+				<div class="flex-container flexGap5 m-b-1">
+					<button type="button" id="ccpm-select-all" class="menu_button menu_button_icon interactable">Select All</button>
+					<button type="button" id="ccpm-unselect-all" class="menu_button menu_button_icon interactable">Unselect All</button>
+				</div>
 				<div class="flex-container flexWrap flexGap10 m-t-1">
 					${promptList.map(p => `
 						<div class="flex-container alignItemsCenter flexGap5">
@@ -2158,6 +2162,15 @@ async function showCreateTemplateDialog() {
 		okButton: 'Create',
 		cancelButton: 'Cancel',
 		allowVerticalScrolling: true,
+		onOpen: () => {
+			// Setup select/unselect all buttons
+			document.getElementById('ccpm-select-all')?.addEventListener('click', () => {
+				document.querySelectorAll('input[name="ccpm-prompts"]').forEach(cb => cb.checked = true);
+			});
+			document.getElementById('ccpm-unselect-all')?.addEventListener('click', () => {
+				document.querySelectorAll('input[name="ccpm-prompts"]').forEach(cb => cb.checked = false);
+			});
+		},
 		onClosing: (popup) => {
 			// Capture values before popup closes and DOM is removed
 			if (popup.result === POPUP_RESULT.AFFIRMATIVE) {

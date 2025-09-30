@@ -4,6 +4,11 @@
 
 All notable changes to CCPromptManager will be documented in this file.
 
+## [1.0.2] - 2025-09-30
+
+### Added
+- "Select All" and "Unselect All" buttons in template creation dialog for easier prompt selection
+
 ## [1.0.1] - 2025-09-30
 
 ### Fixed
