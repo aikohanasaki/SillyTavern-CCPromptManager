@@ -1,7 +1,8 @@
-import { Popup, POPUP_TYPE } from '../../../popup.js';
-import { extension_settings, saveMetadataDebounced, getContext } from '../../../extensions.js';
-import { eventSource, event_types, chat_metadata, name2, systemUserName, neutralCharacterName, characters } from '../../../../script.js';
+import { Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
+import { extension_settings, getContext } from '../../../extensions.js';
+import { eventSource, event_types, chat_metadata, name2, systemUserName, neutralCharacterName, characters, saveSettingsDebounced } from '../../../../script.js';
 import { power_user } from '../../../power-user.js';
+import { oai_settings, promptManager } from '../../../openai.js';
 import { selected_group, groups, editGroup } from '../../../group-chats.js';
 
 const MODULE_NAME = 'CCPM';
@@ -162,7 +163,7 @@ class TemplateStorageAdapter {
     }
 
     saveExtensionSettings() {
-        saveMetadataDebounced();
+        saveSettingsDebounced();
     }
 
     // Character template locks
@@ -553,14 +554,18 @@ class PromptTemplate {
 	 * @param {string} param0.name - Name of the template
 	 * @param {string} param0.description - Description of the template
 	 * @param {Object} param0.prompts - SillyTavern prompt configuration object
+	 * @param {Array} [param0.promptOrder] - Order of prompts
+	 * @param {string} [param0.characterName] - Name of character this template was created for
 	 * @param {string} [param0.id] - Optional unique identifier
 	 */
-	constructor({ name, description, prompts, id }) {
+	constructor({ name, description, prompts, promptOrder, characterName, id }) {
 		this.id = id || PromptTemplate.generateId();
 		this.name = name;
 		this.description = description;
 		// Store ST-compatible prompt structure
 		this.prompts = this.validateAndNormalizePrompts(prompts || {});
+		this.promptOrder = promptOrder || [];
+		this.characterName = characterName || null; // Store for reference/display
 		this.createdAt = new Date().toISOString();
 		this.updatedAt = new Date().toISOString();
 	}
@@ -572,19 +577,15 @@ class PromptTemplate {
 	 */
 	validateAndNormalizePrompts(prompts) {
 		const normalized = {};
-		const validIdentifiers = ['main', 'nsfw', 'jailbreak', 'impersonation', 'utility'];
 
-		// Ensure we have valid SillyTavern prompt structure
+		// Accept all prompts - ST supports many identifiers dynamically
+		// Don't filter by a hardcoded list to avoid data loss
 		for (const [identifier, promptData] of Object.entries(prompts)) {
-			if (validIdentifiers.includes(identifier) && promptData) {
+			if (identifier && promptData && typeof promptData === 'object') {
+				// Keep all existing properties from ST's prompt structure
 				normalized[identifier] = {
 					identifier: identifier,
-					name: promptData.name || this.getDefaultPromptName(identifier),
-					system_prompt: promptData.system_prompt || false,
-					role: promptData.role || 'system',
-					content: promptData.content || '',
-					injection_position: promptData.injection_position || 0,
-					injection_depth: promptData.injection_depth || 4
+					...promptData  // Preserve all ST prompt properties
 				};
 			}
 		}
@@ -650,29 +651,46 @@ class PromptTemplateManager {
 
 		if (!extension_settings.ccPromptManager) {
 			extension_settings.ccPromptManager = defaultSettings;
-			this.saveSettings();
+			// Don't save during initialization - SillyTavern will handle persistence
 		}
 	}
 
 	// Save current state to settings
 	saveSettings() {
+		console.log('CCPM DEBUG: saveSettings called');
 		if (!extension_settings.ccPromptManager) {
 			extension_settings.ccPromptManager = {};
 		}
 
-		extension_settings.ccPromptManager.templates = this.exportTemplates().reduce((acc, template) => {
+		const exported = this.exportTemplates();
+		console.log('CCPM DEBUG: Exporting templates, count:', exported.length);
+		extension_settings.ccPromptManager.templates = exported.reduce((acc, template) => {
 			acc[template.id] = template;
 			return acc;
 		}, {});
 
-		saveMetadataDebounced();
+		console.log('CCPM DEBUG: Templates saved to extension_settings, ids:', Object.keys(extension_settings.ccPromptManager.templates));
+		console.log('CCPM DEBUG: Calling saveSettingsDebounced');
+		saveSettingsDebounced();
 	}
 
 	// Load templates from settings
 	loadTemplatesFromSettings() {
+		console.log('CCPM DEBUG: loadTemplatesFromSettings called');
+		console.log('CCPM DEBUG: extension_settings.ccPromptManager exists?', !!extension_settings.ccPromptManager);
 		if (extension_settings.ccPromptManager?.templates) {
+			console.log('CCPM DEBUG: Found templates in extension_settings, count:', Object.keys(extension_settings.ccPromptManager.templates).length);
 			const templateData = Object.values(extension_settings.ccPromptManager.templates);
-			this.importTemplates(templateData);
+			console.log('CCPM DEBUG: Template data to load:', templateData);
+			// Import without saving (avoid infinite loop with SETTINGS_UPDATED event)
+			for (const data of templateData) {
+				const tmpl = new PromptTemplate(data);
+				console.log('CCPM DEBUG: Loading template:', tmpl.id, tmpl.name);
+				this.templates.set(tmpl.id, tmpl);
+			}
+			console.log('CCPM DEBUG: Templates loaded, this.templates.size:', this.templates.size);
+		} else {
+			console.log('CCPM DEBUG: No templates found in extension_settings');
 		}
 	}
 
@@ -682,8 +700,12 @@ class PromptTemplateManager {
 	 * @returns {PromptTemplate}
 	 */
 	createTemplate(data) {
+		console.log('CCPM DEBUG: createTemplate called with data:', data);
 		const tmpl = new PromptTemplate(data);
+		console.log('CCPM DEBUG: PromptTemplate created, id:', tmpl.id, 'name:', tmpl.name);
 		this.templates.set(tmpl.id, tmpl);
+		console.log('CCPM DEBUG: Template added to this.templates Map, size:', this.templates.size);
+		console.log('CCPM DEBUG: Calling saveSettings from createTemplate');
 		this.saveSettings();
 		return tmpl;
 	}
@@ -739,11 +761,41 @@ class PromptTemplateManager {
 	 * @param {Array<Object>} arr
 	 */
 	importTemplates(arr) {
+		let imported = 0;
+		let skipped = 0;
+
 		for (const data of arr) {
+			// Validate required fields
+			if (!data.name || typeof data.name !== 'string') {
+				console.warn('CCPM: Skipping template - missing or invalid name');
+				skipped++;
+				continue;
+			}
+
+			if (!data.prompts || typeof data.prompts !== 'object' || Object.keys(data.prompts).length === 0) {
+				console.warn('CCPM: Skipping template - missing or empty prompts:', data.name);
+				skipped++;
+				continue;
+			}
+
+			if (!data.promptOrder || !Array.isArray(data.promptOrder) || data.promptOrder.length === 0) {
+				console.warn('CCPM: Skipping template - missing or empty promptOrder:', data.name);
+				skipped++;
+				continue;
+			}
+
+			// Force regenerate ID to prevent XSS from malicious imported templates
+			delete data.id;
 			const tmpl = new PromptTemplate(data);
 			this.templates.set(tmpl.id, tmpl);
+			imported++;
 		}
-		this.saveSettings();
+
+		if (imported > 0) {
+			this.saveSettings();
+		}
+
+		return { imported, skipped };
 	}
 
 	/**
@@ -757,6 +809,7 @@ class PromptTemplateManager {
 			description: t.description,
 			prompts: t.prompts,
 			promptOrder: t.promptOrder,
+			characterName: t.characterName,
 			createdAt: t.createdAt,
 			updatedAt: t.updatedAt,
 		}));
@@ -765,35 +818,65 @@ class PromptTemplateManager {
 	/**
 	 * Apply a template to SillyTavern's prompt system
 	 * @param {string} templateId
-	 * @returns {boolean} Success status
+	 * @returns {Promise<boolean>} Success status
 	 */
-	applyTemplate(templateId) {
+	async applyTemplate(templateId) {
 		const tmpl = this.getTemplate(templateId);
 		if (!tmpl) {
-			toastr.error('Template not found:', templateId);
+			toastr.error('Template not found: ' + templateId);
 			return false;
 		}
 
 		try {
-			// Apply each prompt to SillyTavern's power_user.prompts
-			for (const [identifier, promptData] of Object.entries(tmpl.prompts)) {
-				if (power_user.prompts && power_user.prompts[identifier]) {
-					// Update existing prompt
-					Object.assign(power_user.prompts[identifier], promptData);
-				} else {
-					// Create new prompt entry
-					if (!power_user.prompts) power_user.prompts = {};
-					power_user.prompts[identifier] = { ...promptData };
-				}
+			if (!promptManager) {
+				toastr.error('PromptManager not available');
+				return false;
 			}
 
-			// Trigger SillyTavern's prompt system update
-			eventSource.emit(event_types.SETTINGS_UPDATED);
+			// Convert template's prompts object to array format for ST's updatePrompts
+			const promptUpdates = Object.values(tmpl.prompts);
 
-			console.log('Template applied successfully:', tmpl.name);
+			// Use ST's updatePrompts to apply all prompt changes
+			promptManager.updatePrompts(promptUpdates);
+
+			// Restore prompt order if saved in template
+			// Use ST's pattern from import() method: get existing order and Object.assign
+			if (tmpl.promptOrder && Array.isArray(tmpl.promptOrder) && tmpl.promptOrder.length > 0) {
+				// Get current character context
+				const context = getContext();
+				const currentCharId = context.characterId;
+
+				// Determine target character (use current character, or global dummyId 100000 if no character)
+				const character = { id: currentCharId || 100000 };
+
+				// Get existing order array and assign new order (mutates in place, preserving reference)
+				const existingOrder = promptManager.getPromptOrderForCharacter(character);
+
+				if (existingOrder.length === 0) {
+					// No existing order, add new one
+					promptManager.addPromptOrderForCharacter(character, tmpl.promptOrder);
+				} else {
+					// Update existing order in place using ST's pattern
+					Object.assign(existingOrder, tmpl.promptOrder);
+				}
+
+				console.log('CCPM: Restored prompt order for character', character.id, ':', tmpl.promptOrder.length, 'items');
+			}
+
+			// Save settings and trigger update using PromptManager's method
+			await promptManager.saveServiceSettings();
+
+			// Optionally re-render the prompt manager UI if it's open
+			if (typeof promptManager.render === 'function') {
+				await promptManager.render();
+			}
+
+			toastr.success(`Template "${tmpl.name}" applied`);
+			console.log('CCPM: Template applied successfully:', tmpl.name);
 			return true;
 		} catch (error) {
-			toastr.error('Failed to apply template:', error);
+			console.error('CCPM: Failed to apply template:', error);
+			toastr.error('Failed to apply template: ' + error.message);
 			return false;
 		}
 	}
@@ -806,23 +889,59 @@ class PromptTemplateManager {
 	 * @returns {PromptTemplate}
 	 */
 	createTemplateFromCurrent(name, description, includePrompts = null) {
+		console.log('CCPM DEBUG: createTemplateFromCurrent called');
+		console.log('CCPM DEBUG: name:', name, 'description:', description, 'includePrompts:', includePrompts);
 		const currentPrompts = {};
-		const availablePrompts = power_user.prompts || {};
+		const availablePrompts = oai_settings.prompts || [];
+		console.log('CCPM DEBUG: availablePrompts is array?', Array.isArray(availablePrompts), 'length:', availablePrompts.length);
+
+		// Convert array format to object format keyed by identifier
+		const promptsMap = Array.isArray(availablePrompts)
+			? availablePrompts.reduce((acc, p) => {
+				if (p.identifier) acc[p.identifier] = p;
+				return acc;
+			}, {})
+			: availablePrompts;
 
 		// Include specified prompts or all available prompts
-		const promptsToInclude = includePrompts || Object.keys(availablePrompts);
+		const promptsToInclude = includePrompts || Object.keys(promptsMap);
+		console.log('CCPM DEBUG: promptsToInclude:', promptsToInclude);
 
 		for (const identifier of promptsToInclude) {
-			if (availablePrompts[identifier]) {
-				currentPrompts[identifier] = { ...availablePrompts[identifier] };
+			if (promptsMap[identifier]) {
+				currentPrompts[identifier] = { ...promptsMap[identifier] };
 			}
 		}
 
-		return this.createTemplate({
+		console.log('CCPM DEBUG: currentPrompts collected, keys:', Object.keys(currentPrompts));
+
+		// Capture prompt order using ST's PromptManager
+		// Get current context to determine which character's order to capture
+		const context = getContext();
+		const currentCharId = context.characterId;
+		const currentCharName = context.name2 || name2;
+		console.log('CCPM DEBUG: Current character - ID:', currentCharId, 'Name:', currentCharName);
+
+		// Use ST's PromptManager to get the order array
+		// For no character or global, use dummyId (100000)
+		let promptOrderToSave = [];
+		if (promptManager) {
+			const character = currentCharId ? { id: currentCharId } : { id: 100000 };
+			promptOrderToSave = promptManager.getPromptOrderForCharacter(character);
+			console.log('CCPM DEBUG: Retrieved prompt order via PromptManager:', promptOrderToSave.length, 'items');
+		} else {
+			console.warn('CCPM: PromptManager not available, prompt order will not be saved');
+		}
+
+		const result = this.createTemplate({
 			name,
 			description,
-			prompts: currentPrompts
+			prompts: currentPrompts,
+			promptOrder: promptOrderToSave,
+			characterName: currentCharName
 		});
+		console.log('CCPM DEBUG: createTemplate returned:', result);
+		return result;
 	}
 
 	// Set up event handlers
@@ -1019,7 +1138,7 @@ class PromptTemplateManager {
 			const lockResult = await this.lockManager.getLockToApply();
 			if (lockResult.templateId) {
 				console.log(`CCPM: Applying locked template from ${lockResult.source}:`, lockResult.templateId);
-				return this.applyTemplate(lockResult.templateId);
+				return await this.applyTemplate(lockResult.templateId);
 			}
 			return false;
 		} catch (error) {
@@ -1045,38 +1164,36 @@ class PromptTemplateManager {
 				return false;
 			}
 
-			return new Promise((resolve) => {
-				const content = document.createElement('div');
-				content.innerHTML = `
-					<div class="ccpm-dialog-content">
-						<h4>Apply Locked Template?</h4>
-						<p>A template is locked for this ${lockResult.source}:</p>
-						<div style="background: var(--grey20); padding: 12px; border-radius: 6px; margin: 12px 0;">
-							<strong>${escapeHtml(template.name)}</strong>
-							${template.description ? `<br><small style="color: var(--grey70);">${escapeHtml(template.description)}</small>` : ''}
-						</div>
-						<p>Would you like to apply this template now?</p>
+			const content = document.createElement('div');
+			content.innerHTML = `
+				<div class="flex-container flexFlowColumn flexGap10">
+					<h4>Apply Locked Template?</h4>
+					<p>A template is locked for this ${lockResult.source}:</p>
+					<div class="text_pole padding10">
+						<strong>${escapeHtml(template.name)}</strong>
+						${template.description ? `<br><small class="text_muted">${escapeHtml(template.description)}</small>` : ''}
 					</div>
-				`;
+					<p>Would you like to apply this template now?</p>
+				</div>
+			`;
 
-				const popup = new Popup(content, POPUP_TYPE.CONFIRM, 'Apply Template', {
-					okButton: 'Apply',
-					cancelButton: 'Skip',
-					onOk: () => {
-						console.log(`CCPM: User chose to apply locked template from ${lockResult.source}:`, lockResult.templateId);
-						const success = this.applyTemplate(lockResult.templateId);
-						if (success) {
-							toastr.success(`Applied template: ${template.name}`, 'CCPM');
-						}
-						resolve(success);
-					},
-					onCancel: () => {
-						console.log('CCPM: User chose to skip applying locked template');
-						resolve(false);
-					}
-				});
-				popup.show();
+			const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
+				okButton: 'Apply',
+				cancelButton: 'Skip',
 			});
+
+			const result = await popup.show();
+			if (result) {
+				console.log(`CCPM: User chose to apply locked template from ${lockResult.source}:`, lockResult.templateId);
+				const success = await this.applyTemplate(lockResult.templateId);
+				if (success) {
+					toastr.success(`Applied template: ${template.name}`, 'CCPM');
+				}
+				return success;
+			} else {
+				console.log('CCPM: User chose to skip applying locked template');
+				return false;
+			}
 		} catch (error) {
 			toastr.error('CCPM: Error asking to apply locked template:', error);
 			return false;
@@ -1186,46 +1303,50 @@ function injectPromptTemplateManagerButton() {
 		}
 		if (document.getElementById('ccpm-prompt-template-btn')) return;
 
-		// Create button
-		const btn = document.createElement('button');
-		btn.id = 'ccpm-prompt-template-btn';
-		btn.className = 'menu_button';
-		btn.innerText = 'Prompt Templates';
-		btn.style.margin = '4px 0';
-		btn.onclick = openPromptTemplateManagerModal;
+		// Create menu item using SillyTavern's standard extension menu format
+		const menuItem = $(`
+			<div id="ccpm-menu-item-container" class="extension_container interactable" tabindex="0">
+				<div id="ccpm-prompt-template-btn" class="list-group-item flex-container flexGap5 interactable" tabindex="0">
+					<div class="fa-fw fa-solid fa-folder-open extensionsMenuExtensionButton"></div>
+					<span>Prompt Templates</span>
+				</div>
+			</div>
+		`);
+
+		// Attach click handler
+		menuItem.on('click', openPromptTemplateManagerModal);
 
 		// Insert at top of extensions menu
-		menu.insertBefore(btn, menu.firstChild);
+		$('#extensionsMenu').prepend(menuItem);
 	};
 	tryInject();
 }
 
 function openPromptTemplateManagerModal() {
 	const content = document.createElement('div');
-	content.className = 'ccpm-ptm-content';
 	content.innerHTML = `
 		<div class="title_restorable">
 			<h3>Prompt Template Manager</h3>
 		</div>
-		<div class="ccpm-toolbar flex gap10px marginBot10">
-			<div class="menu_button" id="ccpm-create-from-current">
+		<div class="flex-container alignItemsCenter marginBot10" style="padding-bottom: 10px; border-bottom: 1px solid var(--SmartThemeBorderColor);">
+			<div class="menu_button menu_button_icon interactable" id="ccpm-create-from-current">
 				<i class="fa-solid fa-plus"></i>
 				<span>Create from Current</span>
 			</div>
-			<div class="menu_button" id="ccpm-import-template">
+			<div class="menu_button menu_button_icon interactable" id="ccpm-import-template">
 				<i class="fa-solid fa-file-import"></i>
 				<span>Import</span>
 			</div>
-			<div class="menu_button" id="ccpm-export-all">
+			<div class="menu_button menu_button_icon interactable" id="ccpm-export-all">
 				<i class="fa-solid fa-file-export"></i>
 				<span>Export All</span>
 			</div>
 		</div>
-		<div id="ccpm-ptm-list" class="ccpm-template-list"></div>
+		<div id="ccpm-ptm-list" class="flex-container flexFlowColumn overflowYAuto" style="max-height: 60vh;"></div>
 	`;
 
 	// Render the template list after popup is shown
-	const popup = new Popup(content, POPUP_TYPE.TEXT, '', {
+	ccpmMainPopup = new Popup(content, POPUP_TYPE.TEXT, '', {
 		okButton: false,
 		cancelButton: 'Close',
 		wide: true,
@@ -1235,7 +1356,7 @@ function openPromptTemplateManagerModal() {
 			setupTemplateManagerEvents();
 		},
 	});
-	popup.show();
+	ccpmMainPopup.show();
 }
 
 async function renderPromptTemplateList() {
@@ -1245,8 +1366,8 @@ async function renderPromptTemplateList() {
 
 	if (templates.length === 0) {
 		listDiv.innerHTML = `
-			<div class="justifyCenter">
-				<div class="text_pole">
+			<div class="flex-container justifyCenter">
+				<div class="text_pole textAlignCenter">
 					<i class="fa-solid fa-info-circle"></i>
 					No templates found. Create one from your current prompts!
 				</div>
@@ -1271,54 +1392,54 @@ async function renderPromptTemplateList() {
 
 		let lockStatus = '';
 		if (isEffectiveTemplate) {
-			lockStatus = `<span class="ccpm-lock-status active" title="Currently active from ${effectiveLock.source}">🔒 Active (${effectiveLock.source})</span>`;
+			lockStatus = `<span class="fontsize80p toggleEnabled" title="Currently active from ${effectiveLock.source}">🔒 Active (${effectiveLock.source})</span>`;
 		} else if (isLockedToCharacter || isLockedToChat || isLockedToGroup) {
 			const lockTypes = [];
 			if (isLockedToCharacter) lockTypes.push('character');
 			if (isLockedToChat) lockTypes.push('chat');
 			if (isLockedToGroup) lockTypes.push('group');
-			lockStatus = `<span class="ccpm-lock-status" title="Locked to: ${lockTypes.join(', ')}">🔒 ${lockTypes.join(', ')}</span>`;
+			lockStatus = `<span class="fontsize80p text_muted" title="Locked to: ${lockTypes.join(', ')}">🔒 ${lockTypes.join(', ')}</span>`;
 		}
 
+		const borderStyle = isEffectiveTemplate ? 'border-left: 4px solid var(--SmartThemeQuoteColor);' : '';
+
 		return `
-			<div class="ccpm-template-item marginBot10 ${isEffectiveTemplate ? 'effective-template' : ''}">
-				<div class="ccpm-template-header flex justifySpaceBetween marginBot5">
-					<div class="ccpm-template-info flexGrow">
-						<div class="ccpm-template-title">
+			<div class="text_pole padding10 marginBot10" style="${borderStyle}">
+				<div class="flex-container spaceBetween alignItemsCenter marginBot5">
+					<div class="flexGrow">
+						<div class="fontsize120p">
 							${escapeHtml(t.name)}
 							${lockStatus}
 						</div>
-						<div class="ccpm-template-meta">
-							<span class="ccpm-prompt-count">${promptCount} prompt${promptCount !== 1 ? 's' : ''}</span>
-							<span class="ccpm-date">Created: ${createdDate}</span>
+						<div class="fontsize90p text_muted flex-container flexGap10">
+							<span class="toggleEnabled">${promptCount} prompt${promptCount !== 1 ? 's' : ''}</span>
+							<span>Created: ${createdDate}</span>
 						</div>
 					</div>
-					<div class="ccpm-template-actions flex gap3px">
-						<div class="menu_button menu_button_icon" onclick="window.ccpmApplyTemplate('${t.id}')" title="Apply Template">
+					<div class="flex-container flexGap2">
+						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmApplyTemplate('${t.id}')" title="Apply Template" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-play"></i>
 						</div>
-						<div class="menu_button menu_button_icon" onclick="window.ccpmShowLockMenu('${t.id}')" title="Lock/Unlock Template">
+						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmShowLockMenu('${t.id}')" title="Lock/Unlock Template" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-lock"></i>
 						</div>
-						<div class="menu_button menu_button_icon" onclick="window.ccpmEditTemplate('${t.id}')" title="Edit Template">
+						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmEditTemplate('${t.id}')" title="Edit Template" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-edit"></i>
 						</div>
-						<div class="menu_button menu_button_icon redWarningBG" onclick="window.ccpmDeleteTemplate('${t.id}')" title="Delete Template">
+						<div class="menu_button menu_button_icon interactable redOverlayGlow" onclick="window.ccpmDeleteTemplate('${t.id}')" title="Delete Template" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-trash"></i>
 						</div>
 					</div>
 				</div>
-				${t.description ? `<div class="ccpm-template-description marginBot10">${escapeHtml(t.description)}</div>` : ''}
-				<div class="ccpm-template-prompts flex flexWrap gap5px">
+				${t.description ? `<div class="text_muted fontsize90p marginBot10">${escapeHtml(t.description)}</div>` : ''}
+				<div class="flex-container flexWrap flexGap5">
 					${Object.keys(t.prompts).map(identifier =>
-						`<span class="ccpm-prompt-tag">${identifier}</span>`
+						`<span class="fontsize80p padding5 toggleEnabled" style="border-radius: 12px;">${identifier}</span>`
 					).join('')}
 				</div>
 			</div>
 		`;
 	}).join('');
-
-	injectCCPMStyles();
 }
 
 function escapeHtml(text) {
@@ -1342,227 +1463,32 @@ function setupTemplateManagerEvents() {
 	});
 }
 
-function injectCCPMStyles() {
-	if (document.getElementById('ccpm-styles')) return;
-
-	const style = document.createElement('style');
-	style.id = 'ccpm-styles';
-	style.innerHTML = `
-		/* CCPM Main Layout */
-		.ccpm-ptm-content {
-			min-width: 600px;
-			max-width: 800px;
-		}
-
-		.ccpm-toolbar {
-			padding-bottom: 10px;
-			border-bottom: 1px solid var(--grey30);
-		}
-
-		/* Template List */
-		.ccpm-template-list {
-			max-height: 60vh;
-			overflow-y: auto;
-		}
-
-		.ccpm-template-item {
-			background: var(--SmartThemeBlurTintColor);
-			border: 1px solid var(--SmartThemeBorderColor);
-			border-radius: 8px;
-			padding: 16px;
-			transition: all 0.2s ease;
-		}
-
-		.ccpm-template-item:hover {
-			background: var(--grey30);
-			border-color: var(--grey50);
-		}
-
-		.ccpm-template-header {
-			align-items: flex-start;
-		}
-
-		.ccpm-template-info {
-			flex: 1;
-		}
-
-		.ccpm-template-title {
-			font-size: 1.1em;
-			font-weight: 600;
-			color: var(--SmartThemeBodyColor);
-			margin-bottom: 4px;
-		}
-
-		.ccpm-template-meta {
-			display: flex;
-			gap: 16px;
-			font-size: 0.85em;
-			color: var(--grey70);
-		}
-
-		.ccpm-prompt-count {
-			color: var(--SmartThemeQuoteColor);
-			font-weight: 500;
-		}
-
-		.ccpm-template-actions {
-			gap: 4px;
-		}
-
-		.ccpm-template-actions .menu_button {
-			width: 32px;
-			height: 32px;
-			padding: 0;
-		}
-
-		.ccpm-template-description {
-			color: var(--grey70);
-			font-size: 0.9em;
-			line-height: 1.4;
-		}
-
-		.ccpm-template-prompts {
-			gap: 6px;
-		}
-
-		.ccpm-prompt-tag {
-			background: var(--SmartThemeQuoteColor);
-			color: var(--SmartThemeBodyColor);
-			padding: 2px 8px;
-			border-radius: 12px;
-			font-size: 0.8em;
-			font-weight: 500;
-		}
-
-		/* Dialog Styles */
-		.ccpm-dialog-content {
-			padding: 16px 0;
-		}
-
-		.ccpm-form-group {
-			margin-bottom: 16px;
-		}
-
-		.ccpm-form-group label {
-			display: block;
-			margin-bottom: 6px;
-			font-weight: 500;
-			color: var(--SmartThemeBodyColor);
-		}
-
-		.ccpm-form-group input,
-		.ccpm-form-group textarea {
-			width: 100%;
-			padding: 8px 12px;
-			border: 1px solid var(--SmartThemeBorderColor);
-			border-radius: 4px;
-			background: var(--SmartThemeBlurTintColor);
-			color: var(--SmartThemeBodyColor);
-			font-family: inherit;
-		}
-
-		.ccpm-form-group textarea {
-			resize: vertical;
-			min-height: 80px;
-		}
-
-		.ccpm-checkbox-group {
-			display: flex;
-			flex-wrap: wrap;
-			gap: 12px;
-			margin-top: 8px;
-		}
-
-		.ccpm-checkbox-item {
-			display: flex;
-			align-items: center;
-			gap: 6px;
-		}
-
-		.ccpm-checkbox-item input[type="checkbox"] {
-			width: auto;
-		}
-
-		/* Lock Status Styles */
-		.ccpm-lock-status {
-			font-size: 0.8em;
-			padding: 2px 6px;
-			border-radius: 3px;
-			background: var(--grey30);
-			color: var(--grey70);
-			margin-left: 8px;
-		}
-
-		.ccpm-lock-status.active {
-			background: var(--SmartThemeQuoteColor);
-			color: var(--SmartThemeBodyColor);
-			font-weight: 600;
-		}
-
-		.ccpm-template-item.effective-template {
-			border-left: 4px solid var(--SmartThemeQuoteColor);
-			background: var(--grey10);
-		}
-
-		/* Lock Menu Styles */
-		.ccpm-lock-targets {
-			gap: 10px;
-			margin: 16px 0;
-		}
-
-		.ccpm-lock-target {
-			padding: 10px;
-			border: 1px solid var(--SmartThemeBorderColor);
-			border-radius: 6px;
-			background: var(--SmartThemeBlurTintColor);
-		}
-
-		.ccpm-lock-info {
-			flex: 1;
-		}
-
-		.ccpm-lock-info small {
-			color: var(--grey70);
-		}
-
-		.ccpm-lock-active {
-			color: var(--SmartThemeQuoteColor);
-			font-weight: 600;
-		}
-
-		.ccpm-lock-conflict {
-			color: var(--fullred);
-			font-weight: 600;
-		}
-
-		.ccpm-lock-actions {
-			margin-left: 12px;
-		}
-	`;
-	document.head.appendChild(style);
-}
+// Store reference to the main template manager popup
+let ccpmMainPopup = null;
 
 // Expose template management functions for buttons
-window.ccpmApplyTemplate = function(id) {
-	if (promptTemplateManager.applyTemplate(id)) {
+window.ccpmApplyTemplate = async function(id) {
+	if (await promptTemplateManager.applyTemplate(id)) {
 		toastr.success('Template applied successfully!');
-		// Close the popup
-		document.querySelector('.popup')?.remove();
+		// Close the main popup
+		if (ccpmMainPopup?.dlg) {
+			ccpmMainPopup.dlg.close();
+		}
 	} else {
 		toastr.error('Failed to apply template');
 	}
 };
 
-window.ccpmEditTemplate = function(id) {
+window.ccpmEditTemplate = async function(id) {
 	const template = promptTemplateManager.getTemplate(id);
 	if (!template) {
 		toastr.error('Template not found');
 		return;
 	}
-	showEditTemplateDialog(template);
+	await showEditTemplateDialog(template);
 };
 
-window.ccpmDeleteTemplate = function(id) {
+window.ccpmDeleteTemplate = async function(id) {
 	const template = promptTemplateManager.getTemplate(id);
 	if (!template) {
 		toastr.error('Template not found');
@@ -1571,26 +1497,28 @@ window.ccpmDeleteTemplate = function(id) {
 
 	const content = document.createElement('div');
 	content.innerHTML = `
-		<div class="ccpm-dialog-content">
+		<div class="flex-container flexFlowColumn flexGap10">
 			<p>Are you sure you want to delete the template "<strong>${escapeHtml(template.name)}</strong>"?</p>
-			<span class="info-block warning">This action cannot be undone.</span>
+			<div class="text_pole padding10 text_danger">
+				<strong>⚠️ This action cannot be undone.</strong>
+			</div>
 		</div>
 	`;
 
 	const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
 		okButton: 'Delete',
 		cancelButton: 'Cancel',
-		okClass: 'redWarningBG',
-		onOk: () => {
-			if (promptTemplateManager.deleteTemplate(id)) {
-				toastr.success('Template deleted successfully');
-				renderPromptTemplateList();
-			} else {
-				toastr.error('Failed to delete template');
-			}
-		}
 	});
-	popup.show();
+
+	const result = await popup.show();
+	if (result) {
+		if (promptTemplateManager.deleteTemplate(id)) {
+			toastr.success('Template deleted successfully');
+			await renderPromptTemplateList();
+		} else {
+			toastr.error('Failed to delete template');
+		}
+	}
 };
 
 window.ccpmShowLockMenu = async function(templateId) {
@@ -1617,31 +1545,31 @@ window.ccpmShowLockMenu = async function(templateId) {
 
 	const content = document.createElement('div');
 	content.innerHTML = `
-		<div class="ccpm-dialog-content">
+		<div class="flex-container flexFlowColumn flexGap10">
 			<h4>Lock Template: ${escapeHtml(template.name)}</h4>
 			<p>Choose where to lock this template:</p>
 
-			<div class="ccpm-lock-targets flexFlowColumn gap10px">
+			<div class="flex-container flexFlowColumn flexGap10">
 				${availableTargets.map(target => {
 					const isCurrentlyLocked = currentLocks[target] === templateId;
 					const hasOtherLock = currentLocks[target] && currentLocks[target] !== templateId;
 					const contextName = getContextName(context, target);
 
 					return `
-						<div class="ccpm-lock-target flex justifySpaceBetween">
-							<div class="ccpm-lock-info flexGrow">
+						<div class="text_pole padding10 flex-container spaceBetween alignItemsCenter">
+							<div class="flexGrow">
 								<strong>${target.charAt(0).toUpperCase() + target.slice(1)}</strong>
-								${contextName ? `<br><small>${contextName}</small>` : ''}
-								${isCurrentlyLocked ? '<br><span class="ccpm-lock-active">🔒 Currently locked</span>' : ''}
-								${hasOtherLock ? '<br><span class="ccpm-lock-conflict">⚠️ Another template is locked</span>' : ''}
+								${contextName ? `<br><small class="text_muted">${contextName}</small>` : ''}
+								${isCurrentlyLocked ? '<br><span class="toggleEnabled fontsize90p">🔒 Currently locked</span>' : ''}
+								${hasOtherLock ? '<br><span class="text_danger fontsize90p">⚠️ Another template is locked</span>' : ''}
 							</div>
-							<div class="ccpm-lock-actions">
+							<div>
 								${!isCurrentlyLocked ? `
-									<button class="menu_button" onclick="ccpmLockToTarget('${templateId}', '${target}')">
+									<button class="menu_button interactable" onclick="ccpmLockToTarget('${templateId}', '${target}')">
 										Lock Here
 									</button>
 								` : `
-									<button class="menu_button redWarningBG" onclick="ccpmClearLock('${target}')">
+									<button class="menu_button interactable redOverlayGlow" onclick="ccpmClearLock('${target}')">
 										Unlock
 									</button>
 								`}
@@ -1651,7 +1579,7 @@ window.ccpmShowLockMenu = async function(templateId) {
 				}).join('')}
 			</div>
 
-			${availableTargets.length === 0 ? '<p style="color: var(--grey70);">No lock targets available in current context.</p>' : ''}
+			${availableTargets.length === 0 ? '<p class="text_muted">No lock targets available in current context.</p>' : ''}
 		</div>
 	`;
 
@@ -1683,8 +1611,8 @@ function getContextName(context, target) {
 window.ccpmLockToTarget = async function(templateId, target) {
 	const success = await promptTemplateManager.lockTemplate(templateId, target);
 	if (success) {
-		// Close the lock menu and refresh the template list
-		document.querySelector('.popup')?.remove();
+		// The lock menu popup will close itself via its cancelButton
+		// Just refresh the template list in the main popup
 		await renderPromptTemplateList();
 	}
 };
@@ -1692,39 +1620,43 @@ window.ccpmLockToTarget = async function(templateId, target) {
 window.ccpmClearLock = async function(target) {
 	const success = await promptTemplateManager.clearTemplateLock(target);
 	if (success) {
-		// Close the lock menu and refresh the template list
-		document.querySelector('.popup')?.remove();
+		// The lock menu popup will close itself via its cancelButton
+		// Just refresh the template list in the main popup
 		await renderPromptTemplateList();
 	}
 };
 
-function showCreateTemplateDialog() {
-	const availablePrompts = power_user.prompts || {};
-	const promptIdentifiers = Object.keys(availablePrompts);
+async function showCreateTemplateDialog() {
+	const availablePrompts = oai_settings.prompts || [];
 
-	if (promptIdentifiers.length === 0) {
+	// Handle array format - extract identifiers from prompt objects
+	const promptList = Array.isArray(availablePrompts)
+		? availablePrompts.filter(p => p.identifier).map(p => ({ identifier: p.identifier, name: p.name || p.identifier }))
+		: Object.keys(availablePrompts).map(id => ({ identifier: id, name: availablePrompts[id].name || id }));
+
+	if (promptList.length === 0) {
 		toastr.warning('No prompts found to create template from');
 		return;
 	}
 
 	const content = document.createElement('div');
 	content.innerHTML = `
-		<div class="ccpm-dialog-content">
-			<div class="ccpm-form-group">
-				<label for="ccpm-template-name">Template Name:</label>
-				<input type="text" id="ccpm-template-name" placeholder="Enter template name" required>
+		<div class="flex-container flexFlowColumn flexGap10">
+			<div class="flex-container flexFlowColumn">
+				<label for="ccpm-template-name"><strong>Template Name:</strong></label>
+				<input type="text" id="ccpm-template-name" class="text_pole" placeholder="Enter template name" required>
 			</div>
-			<div class="ccpm-form-group">
-				<label for="ccpm-template-desc">Description (optional):</label>
-				<textarea id="ccpm-template-desc" placeholder="Describe this template"></textarea>
+			<div class="flex-container flexFlowColumn">
+				<label for="ccpm-template-desc"><strong>Description (optional):</strong></label>
+				<textarea id="ccpm-template-desc" class="text_pole" placeholder="Describe this template" style="min-height: 80px; resize: vertical;"></textarea>
 			</div>
-			<div class="ccpm-form-group">
-				<label>Include Prompts:</label>
-				<div class="ccpm-checkbox-group">
-					${promptIdentifiers.map(id => `
-						<div class="ccpm-checkbox-item">
-							<input type="checkbox" id="ccpm-prompt-${id}" value="${id}" checked>
-							<label for="ccpm-prompt-${id}">${id}</label>
+			<div class="flex-container flexFlowColumn">
+				<label><strong>Include Prompts:</strong></label>
+				<div class="flex-container flexWrap flexGap10 m-t-1">
+					${promptList.map(p => `
+						<div class="flex-container alignItemsCenter flexGap5">
+							<input type="checkbox" name="ccpm-prompts" value="${escapeHtml(p.identifier)}" checked class="interactable">
+							<label>${escapeHtml(p.name)}</label>
 						</div>
 					`).join('')}
 				</div>
@@ -1732,118 +1664,149 @@ function showCreateTemplateDialog() {
 		</div>
 	`;
 
-	const popup = new Popup(content, POPUP_TYPE.CONFIRM, 'Create Template', {
+	let capturedData = null;
+
+	const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
 		okButton: 'Create',
 		cancelButton: 'Cancel',
-		onOk: () => {
-			const name = document.getElementById('ccpm-template-name').value.trim();
-			const description = document.getElementById('ccpm-template-desc').value.trim();
+		onClosing: (popup) => {
+			// Capture values before popup closes and DOM is removed
+			if (popup.result === POPUP_RESULT.AFFIRMATIVE) {
+				const name = document.getElementById('ccpm-template-name')?.value.trim();
+				const description = document.getElementById('ccpm-template-desc')?.value.trim();
+				const selectedPrompts = Array.from(document.querySelectorAll('input[name="ccpm-prompts"]:checked'))
+					.map(cb => cb.value);
 
-			if (!name) {
-				toastr.error('Template name is required');
-				return false;
+				console.log('CCPM DEBUG: Captured values - name:', name, 'description:', description, 'prompts:', selectedPrompts);
+
+				if (!name) {
+					toastr.error('Template name is required');
+					return false; // Prevent popup from closing
+				}
+
+				if (selectedPrompts.length === 0) {
+					toastr.error('Select at least one prompt');
+					return false; // Prevent popup from closing
+				}
+
+				capturedData = { name, description, selectedPrompts };
 			}
-
-			const selectedPrompts = Array.from(document.querySelectorAll('.ccpm-checkbox-item input[type="checkbox"]:checked'))
-				.map(cb => cb.value);
-
-			if (selectedPrompts.length === 0) {
-				toastr.error('Select at least one prompt');
-				return false;
-			}
-
-			try {
-				promptTemplateManager.createTemplateFromCurrent(name, description, selectedPrompts);
-				toastr.success('Template created successfully');
-				renderPromptTemplateList();
-				return true;
-			} catch (error) {
-				toastr.error('Failed to create template: ' + error.message);
-				return false;
-			}
+			return true; // Allow popup to close
 		}
 	});
-	popup.show();
+
+	const result = await popup.show();
+	console.log('CCPM DEBUG: Popup result:', result);
+
+	if (!result || !capturedData) {
+		console.log('CCPM DEBUG: User cancelled or no data captured');
+		return;
+	}
+
+	console.log('CCPM DEBUG: User clicked Create');
+
+	try {
+		console.log('CCPM DEBUG: Calling createTemplateFromCurrent');
+		const template = promptTemplateManager.createTemplateFromCurrent(
+			capturedData.name,
+			capturedData.description,
+			capturedData.selectedPrompts
+		);
+		console.log('CCPM DEBUG: createTemplateFromCurrent returned:', template);
+		console.log('CCPM DEBUG: Template count after creation:', promptTemplateManager.listTemplates().length);
+		console.log('CCPM DEBUG: extension_settings.ccPromptManager=', extension_settings.ccPromptManager);
+		toastr.success('Template created successfully');
+		await renderPromptTemplateList();
+	} catch (error) {
+		console.error('CCPM DEBUG: Error creating template:', error);
+		toastr.error('Failed to create template: ' + error.message);
+	}
 }
 
-function showEditTemplateDialog(template) {
+async function showEditTemplateDialog(template) {
 	const content = document.createElement('div');
 	content.innerHTML = `
-		<div class="ccpm-dialog-content">
-			<div class="ccpm-form-group">
-				<label for="ccpm-edit-name">Template Name:</label>
-				<input type="text" id="ccpm-edit-name" value="${escapeHtml(template.name)}" required>
+		<div class="flex-container flexFlowColumn flexGap10">
+			<div class="flex-container flexFlowColumn">
+				<label for="ccpm-edit-name"><strong>Template Name:</strong></label>
+				<input type="text" id="ccpm-edit-name" class="text_pole" value="${escapeHtml(template.name)}" required>
 			</div>
-			<div class="ccpm-form-group">
-				<label for="ccpm-edit-desc">Description:</label>
-				<textarea id="ccpm-edit-desc">${escapeHtml(template.description || '')}</textarea>
+			<div class="flex-container flexFlowColumn">
+				<label for="ccpm-edit-desc"><strong>Description:</strong></label>
+				<textarea id="ccpm-edit-desc" class="text_pole" style="min-height: 80px; resize: vertical;">${escapeHtml(template.description || '')}</textarea>
 			</div>
 		</div>
 	`;
 
-	const popup = new Popup(content, POPUP_TYPE.CONFIRM, 'Edit Template', {
+	let capturedData = null;
+
+	const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
 		okButton: 'Save',
 		cancelButton: 'Cancel',
-		onOk: () => {
-			const name = document.getElementById('ccpm-edit-name').value.trim();
-			const description = document.getElementById('ccpm-edit-desc').value.trim();
+		onClosing: (popup) => {
+			if (popup.result === POPUP_RESULT.AFFIRMATIVE) {
+				const name = document.getElementById('ccpm-edit-name')?.value.trim();
+				const description = document.getElementById('ccpm-edit-desc')?.value.trim();
 
-			if (!name) {
-				toastr.error('Template name is required');
-				return false;
-			}
+				if (!name) {
+					toastr.error('Template name is required');
+					return false;
+				}
 
-			try {
-				promptTemplateManager.updateTemplate(template.id, { name, description });
-				toastr.success('Template updated successfully');
-				renderPromptTemplateList();
-				return true;
-			} catch (error) {
-				toastr.error('Failed to update template: ' + error.message);
-				return false;
+				capturedData = { name, description };
 			}
+			return true;
 		}
 	});
-	popup.show();
+
+	const result = await popup.show();
+	if (!result || !capturedData) return;
+
+	try {
+		promptTemplateManager.updateTemplate(template.id, capturedData);
+		toastr.success('Template updated successfully');
+		await renderPromptTemplateList();
+	} catch (error) {
+		toastr.error('Failed to update template: ' + error.message);
+	}
 }
 
-function showImportTemplateDialog() {
-	const content = document.createElement('div');
-	content.innerHTML = `
-		<div class="ccpm-dialog-content">
-			<div class="ccpm-form-group">
-				<label for="ccpm-import-data">Paste template JSON data:</label>
-				<textarea id="ccpm-import-data" placeholder="Paste exported template data here..." style="min-height: 200px; font-family: monospace;"></textarea>
-			</div>
-		</div>
-	`;
+async function showImportTemplateDialog() {
+	// Create file input
+	const fileInput = document.createElement('input');
+	fileInput.type = 'file';
+	fileInput.accept = '.json';
 
-	const popup = new Popup(content, POPUP_TYPE.CONFIRM, 'Import Template', {
-		okButton: 'Import',
-		cancelButton: 'Cancel',
-		onOk: () => {
-			const data = document.getElementById('ccpm-import-data').value.trim();
+	fileInput.addEventListener('change', async () => {
+		if (fileInput.files.length === 0) return;
 
-			if (!data) {
-				toastr.error('Please paste template data');
-				return false;
+		try {
+			const file = fileInput.files[0];
+			const text = await file.text();
+			const templates = JSON.parse(text);
+			const templatesArray = Array.isArray(templates) ? templates : [templates];
+
+			const result = promptTemplateManager.importTemplates(templatesArray);
+
+			if (result.imported > 0) {
+				toastr.success(`Imported ${result.imported} template(s) successfully`);
+				await renderPromptTemplateList();
 			}
 
-			try {
-				const templates = JSON.parse(data);
-				const templatesArray = Array.isArray(templates) ? templates : [templates];
-
-				promptTemplateManager.importTemplates(templatesArray);
-				toastr.success(`Imported ${templatesArray.length} template(s) successfully`);
-				renderPromptTemplateList();
-				return true;
-			} catch (error) {
-				toastr.error('Failed to import template: Invalid JSON data');
-				return false;
+			if (result.skipped > 0) {
+				toastr.warning(`Skipped ${result.skipped} invalid template(s)`);
 			}
+
+			if (result.imported === 0 && result.skipped === 0) {
+				toastr.error('No valid templates found in file');
+			}
+		} catch (error) {
+			toastr.error('Failed to import template: ' + error.message);
 		}
 	});
-	popup.show();
+
+	// Trigger file picker
+	fileInput.click();
 }
 
 function exportAllTemplates() {
