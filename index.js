@@ -1,6 +1,6 @@
 import { Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
 import { extension_settings, getContext } from '../../../extensions.js';
-import { eventSource, event_types, chat_metadata, name2, systemUserName, neutralCharacterName, characters, saveSettingsDebounced } from '../../../../script.js';
+import { eventSource, event_types, chat_metadata, saveMetadataDebounced, name2, systemUserName, neutralCharacterName, characters, saveSettingsDebounced } from '../../../../script.js';
 import { power_user } from '../../../power-user.js';
 import { oai_settings, promptManager } from '../../../openai.js';
 import { selected_group, groups, editGroup } from '../../../group-chats.js';
@@ -8,6 +8,7 @@ import { escapeHtml } from '../../../utils.js';
 
 const MODULE_NAME = 'CCPM';
 const CACHE_TTL = 1000;
+const GLOBAL_CHARACTER_ID = 100000; // ST's default/global character ID
 
 const CHAT_TYPES = {
     SINGLE: 'single',
@@ -18,7 +19,8 @@ const SETTING_SOURCES = {
     CHARACTER: 'character',
     CHAT: 'chat',
     GROUP: 'group',
-    GROUP_CHAT: 'group chat'
+    GROUP_CHAT: 'group chat',
+    MODEL: 'model'
 };
 
 const AUTO_APPLY_MODES = {
@@ -53,7 +55,7 @@ class ChatContext {
             this.cacheTime = now;
             return context;
         } catch (error) {
-            toastr.error('CCPM: Error building context:', error);
+            toastr.error('CCPM: Error building context: ' + (error?.message || error));
             if (this.cache.has('current')) {
                 toastr.warning('CCPM: Using stale cached context due to build error');
                 return this.cache.get('current');
@@ -69,15 +71,27 @@ class ChatContext {
 
     _buildContext() {
         const isGroupChat = !!selected_group;
+        const connectionProfileName = this._getConnectionProfileName();
 
         if (isGroupChat) {
-            return this._buildGroupContext();
+            return this._buildGroupContext(connectionProfileName);
         } else {
-            return this._buildSingleContext();
+            return this._buildSingleContext(connectionProfileName);
         }
     }
 
-    _buildGroupContext() {
+    _getConnectionProfileName() {
+        try {
+            const selectedProfileId = extension_settings.connectionManager?.selectedProfile;
+            const currentProfile = selectedProfileId ?
+                extension_settings.connectionManager?.profiles?.find(p => p.id === selectedProfileId)?.name || null : null;
+            return currentProfile;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    _buildGroupContext(connectionProfileName) {
         const groupId = selected_group;
         const group = groups?.find(x => x.id === groupId);
 
@@ -90,11 +104,12 @@ class ChatContext {
             chatName: group?.name || null,
             characterName: group?.name || null,
             primaryId: groupId,
-            secondaryId: group?.chat_id
+            secondaryId: group?.chat_id,
+            connectionProfileName
         };
     }
 
-    _buildSingleContext() {
+    _buildSingleContext(connectionProfileName) {
         const characterName = this._getCharacterNameForSettings();
         const chatId = this._getCurrentChatId();
 
@@ -107,7 +122,8 @@ class ChatContext {
             chatName: chatId,
             characterName,
             primaryId: characterName,
-            secondaryId: chatId
+            secondaryId: chatId,
+            connectionProfileName
         };
     }
 
@@ -231,7 +247,7 @@ class TemplateStorageAdapter {
             const group = groups?.find(x => x.id === groupId);
             return group?.ccpm_template_lock || null;
         } catch (error) {
-            toastr.warning('CCPM: Error getting group template lock:', error);
+            toastr.error('CCPM: Error getting group template lock: ' + (error?.message || error));
             return null;
         }
     }
@@ -252,7 +268,7 @@ class TemplateStorageAdapter {
             await editGroup(groupId, false, false);
             return true;
         } catch (error) {
-            toastr.error('CCPM: Error saving group template lock:', error);
+            toastr.error('CCPM: Error saving group template lock: ' + (error?.message || error));
             return false;
         }
     }
@@ -271,7 +287,7 @@ class TemplateStorageAdapter {
             }
             return false;
         } catch (error) {
-            toastr.error('CCPM: Error deleting group template lock:', error);
+            toastr.error('CCPM: Error deleting group template lock: ' + (error?.message || error));
             return false;
         }
     }
@@ -282,7 +298,7 @@ class TemplateStorageAdapter {
             const metadata = getCurrentChatMetadata();
             return metadata?.[this.EXTENSION_KEY]?.templateLock || null;
         } catch (error) {
-            toastr.warning('CCPM: Error getting chat template lock:', error);
+            toastr.warning('CCPM: Error getting chat template lock:' + (error?.message || error));
             return null;
         }
     }
@@ -302,7 +318,7 @@ class TemplateStorageAdapter {
             this._triggerMetadataSave();
             return true;
         } catch (error) {
-            toastr.error('CCPM: Error saving chat template lock:', error);
+            toastr.error('CCPM: Error saving chat template lock: ' + (error?.message || error));
             return false;
         }
     }
@@ -317,7 +333,7 @@ class TemplateStorageAdapter {
             }
             return false;
         } catch (error) {
-            toastr.error('CCPM: Error deleting chat template lock:', error);
+            toastr.error('CCPM: Error deleting chat template lock: ' + (error?.message || error));
             return false;
         }
     }
@@ -331,7 +347,7 @@ class TemplateStorageAdapter {
         try {
             return (typeof chat_metadata !== 'undefined') ? chat_metadata[this.EXTENSION_KEY]?.templateLock || null : null;
         } catch (error) {
-            toastr.warning('CCPM: Error getting group chat template lock:', error);
+            toastr.warning('CCPM: Error getting group chat template lock:' + (error?.message || error));
             return null;
         }
     }
@@ -347,11 +363,12 @@ class TemplateStorageAdapter {
                     chat_metadata[this.EXTENSION_KEY] = {};
                 }
                 chat_metadata[this.EXTENSION_KEY].templateLock = templateId;
+                this._triggerMetadataSave();
                 return true;
             }
             return false;
         } catch (error) {
-            toastr.error('CCPM: Error saving group chat template lock:', error);
+            toastr.error('CCPM: Error saving group chat template lock: ' + (error?.message || error));
             return false;
         }
     }
@@ -368,74 +385,91 @@ class TemplateStorageAdapter {
             }
             return false;
         } catch (error) {
-            toastr.error('CCPM: Error deleting group chat template lock:', error);
+            toastr.error('CCPM: Error deleting group chat template lock: ' + (error?.message || error));
             return false;
         }
+    }
+
+    // Model (connection profile) template locks
+    getModelTemplateLock(profileName) {
+        if (!profileName) {
+            return null;
+        }
+
+        const extensionSettings = this.getExtensionSettings();
+        return extensionSettings.templateLocks?.model?.[profileName] || null;
+    }
+
+    setModelTemplateLock(profileName, templateId) {
+        if (!profileName) {
+            return false;
+        }
+
+        const extensionSettings = this.getExtensionSettings();
+
+        if (!extensionSettings.templateLocks) {
+            extensionSettings.templateLocks = {};
+        }
+        if (!extensionSettings.templateLocks.model) {
+            extensionSettings.templateLocks.model = {};
+        }
+
+        extensionSettings.templateLocks.model[profileName] = templateId;
+        this.saveExtensionSettings();
+        return true;
+    }
+
+    deleteModelTemplateLock(profileName) {
+        if (!profileName) {
+            return false;
+        }
+
+        const extensionSettings = this.getExtensionSettings();
+
+        if (extensionSettings.templateLocks?.model?.[profileName]) {
+            delete extensionSettings.templateLocks.model[profileName];
+            this.saveExtensionSettings();
+            return true;
+        }
+
+        return false;
+    }
+
+    // Chat preference for conflict resolution
+    getChatPreferredLockSource() {
+        const metadata = getCurrentChatMetadata();
+        return metadata?.[this.EXTENSION_KEY]?.preferredLockSource || null;
+    }
+
+    setChatPreferredLockSource(source) {
+        const metadata = getCurrentChatMetadata();
+        if (!metadata[this.EXTENSION_KEY]) {
+            metadata[this.EXTENSION_KEY] = {};
+        }
+        metadata[this.EXTENSION_KEY].preferredLockSource = source;
+        this._triggerMetadataSave();
+        return true;
+    }
+
+    deleteChatPreferredLockSource() {
+        const metadata = getCurrentChatMetadata();
+        if (metadata?.[this.EXTENSION_KEY]?.preferredLockSource) {
+            delete metadata[this.EXTENSION_KEY].preferredLockSource;
+            this._triggerMetadataSave();
+            return true;
+        }
+        return false;
     }
 
     _triggerMetadataSave() {
         try {
             saveMetadataDebounced();
         } catch (error) {
-            toastr.error('CCPM: Error triggering metadata save:', error);
+            toastr.error('CCPM: Error triggering metadata save: ' + (error?.message || error));
         }
     }
 }
 
-/**
- * Template lock priority resolution
- */
-class TemplateLockResolver {
-    constructor(extensionSettings) {
-        this.extensionSettings = extensionSettings;
-    }
-
-    resolve(context, availableLocks) {
-        if (context.isGroupChat) {
-            return this._resolveGroupLocks(context, availableLocks);
-        } else {
-            return this._resolveSingleLocks(context, availableLocks);
-        }
-    }
-
-    _resolveGroupLocks(context, locks) {
-        const prefs = this.extensionSettings;
-        const { group, chat, character } = locks;
-
-        // Use user-defined priorities for group chats
-        if (prefs.preferIndividualCharacterInGroup && character) {
-            return { templateId: character, source: SETTING_SOURCES.CHARACTER };
-        }
-
-        if (prefs.preferGroupOverChat) {
-            if (group) return { templateId: group, source: SETTING_SOURCES.GROUP };
-            if (chat) return { templateId: chat, source: `${SETTING_SOURCES.GROUP_CHAT} (fallback)` };
-            if (character) return { templateId: character, source: `${SETTING_SOURCES.CHARACTER} (fallback)` };
-        } else {
-            if (chat) return { templateId: chat, source: SETTING_SOURCES.GROUP_CHAT };
-            if (group) return { templateId: group, source: `${SETTING_SOURCES.GROUP} (fallback)` };
-            if (character) return { templateId: character, source: `${SETTING_SOURCES.CHARACTER} (fallback)` };
-        }
-
-        return { templateId: null, source: 'none' };
-    }
-
-    _resolveSingleLocks(context, locks) {
-        const prefs = this.extensionSettings;
-        const { character, chat } = locks;
-
-        // Use user-defined priority for single chats
-        if (prefs.preferCharacterOverChat) {
-            if (character) return { templateId: character, source: SETTING_SOURCES.CHARACTER };
-            if (chat) return { templateId: chat, source: `${SETTING_SOURCES.CHAT} (fallback)` };
-        } else {
-            if (chat) return { templateId: chat, source: SETTING_SOURCES.CHAT };
-            if (character) return { templateId: character, source: `${SETTING_SOURCES.CHARACTER} (fallback)` };
-        }
-
-        return { templateId: null, source: 'none' };
-    }
-}
 
 /**
  * Main template lock manager
@@ -443,7 +477,6 @@ class TemplateLockResolver {
 class TemplateLockManager {
     constructor(storage) {
         this.storage = storage;
-        this.lockResolver = new TemplateLockResolver(storage.getExtensionSettings());
         this.chatContext = new ChatContext();
         this.currentLocks = this._getEmptyLocks();
     }
@@ -452,7 +485,8 @@ class TemplateLockManager {
         return {
             character: null,
             chat: null,
-            group: null
+            group: null,
+            model: null
         };
     }
 
@@ -464,6 +498,11 @@ class TemplateLockManager {
             this._loadGroupLocks(context);
         } else {
             this._loadSingleLocks(context);
+        }
+
+        // Load model lock (applies to both single and group chats)
+        if (context.connectionProfileName) {
+            this.currentLocks.model = this.storage.getModelTemplateLock(context.connectionProfileName);
         }
 
         return this.currentLocks;
@@ -495,14 +534,6 @@ class TemplateLockManager {
         }
     }
 
-    async getLockToApply() {
-        const context = this.chatContext.getCurrent();
-        // Pass extension settings to resolver for priority preferences
-        const settings = this.storage.getExtensionSettings();
-        this.lockResolver = new TemplateLockResolver(settings);
-        return this.lockResolver.resolve(context, this.currentLocks);
-    }
-
     async setLock(target, templateId) {
         const context = this.chatContext.getCurrent();
         let success = false;
@@ -528,6 +559,12 @@ class TemplateLockManager {
                 if (context.isGroupChat && context.groupId) {
                     success = await this.storage.setGroupTemplateLock(context.groupId, templateId);
                     if (success) this.currentLocks.group = templateId;
+                }
+                break;
+            case 'model':
+                if (context.connectionProfileName) {
+                    success = this.storage.setModelTemplateLock(context.connectionProfileName, templateId);
+                    if (success) this.currentLocks.model = templateId;
                 }
                 break;
         }
@@ -562,14 +599,20 @@ class TemplateLockManager {
                     if (success) this.currentLocks.group = null;
                 }
                 break;
+            case 'model':
+                if (context.connectionProfileName) {
+                    success = this.storage.deleteModelTemplateLock(context.connectionProfileName);
+                    if (success) this.currentLocks.model = null;
+                }
+                break;
         }
 
         return success;
     }
 
-    onContextChanged() {
+    async onContextChanged() {
         this.chatContext.invalidate();
-        this.loadCurrentLocks();
+        await this.loadCurrentLocks();
     }
 }
 
@@ -660,6 +703,17 @@ class PromptTemplateManager {
 		this.storage = new TemplateStorageAdapter();
 		this.lockManager = new TemplateLockManager(this.storage);
 
+		// Bind event handlers for proper cleanup
+		this.boundHandlers = {
+			settingsUpdate: () => this.handleSettingsUpdate(),
+			presetChange: () => this.handlePresetChange(),
+			chatChange: () => this.handleChatChange(),
+			connectionProfileChange: () => this.handleConnectionProfileChange(),
+			extensionSettingsLoaded: () => this.handleExtensionSettingsLoaded(),
+			appReady: () => this.handleAppReady(),
+			settingsLoadedAfter: () => this.handleSettingsLoadedAfter(),
+		};
+
 		this.initializeSettings();
 		this.loadTemplatesFromSettings();
 		this.setupEventHandlers();
@@ -671,11 +725,6 @@ class PromptTemplateManager {
 			templates: {},
 			templateLocks: {},
 			autoApplyMode: AUTO_APPLY_MODES.ASK,  // 'never', 'ask', or 'always'
-			// Priority preferences for single chat (character vs chat)
-			preferCharacterOverChat: true,
-			// Priority preferences for group chat (group vs chat vs character)
-			preferGroupOverChat: true,
-			preferIndividualCharacterInGroup: false,
 			version: '1.0.0'
 		};
 
@@ -684,16 +733,6 @@ class PromptTemplateManager {
 			// Don't save during initialization - SillyTavern will handle persistence
 		}
 
-		// Ensure all settings exist
-		if (extension_settings.ccPromptManager.preferCharacterOverChat === undefined) {
-			extension_settings.ccPromptManager.preferCharacterOverChat = true;
-		}
-		if (extension_settings.ccPromptManager.preferGroupOverChat === undefined) {
-			extension_settings.ccPromptManager.preferGroupOverChat = true;
-		}
-		if (extension_settings.ccPromptManager.preferIndividualCharacterInGroup === undefined) {
-			extension_settings.ccPromptManager.preferIndividualCharacterInGroup = false;
-		}
 
 		// Migrate old setting if it exists
 		if (extension_settings.ccPromptManager.autoApplyLocked && !extension_settings.ccPromptManager.autoApplyMode) {
@@ -892,6 +931,12 @@ class PromptTemplateManager {
 			console.log('CCPM DEBUG: promptUpdates count:', promptUpdates.length);
 			console.log('CCPM DEBUG: promptUpdates identifiers:', promptUpdates.map(p => p.identifier));
 
+			// Validate template has prompts before replacing
+			if (promptUpdates.length === 0) {
+				toastr.error('Template contains no prompts');
+				return false;
+			}
+
 			// Replace entire prompts array with template prompts (like preset import)
 			oai_settings.prompts = promptUpdates;
 			console.log('CCPM DEBUG: Replaced oai_settings.prompts array');
@@ -901,7 +946,7 @@ class PromptTemplateManager {
 			if (tmpl.promptOrder && Array.isArray(tmpl.promptOrder) && tmpl.promptOrder.length > 0) {
 				// Use the character_id that was stored when the template was created
 				// This ensures we apply to the same character_id (e.g., 100001) that was captured
-				const targetCharacterId = tmpl.promptOrderCharacterId ?? 100000;
+				const targetCharacterId = tmpl.promptOrderCharacterId ?? GLOBAL_CHARACTER_ID;
 				console.log('CCPM DEBUG: Applying prompt order for character ID:', targetCharacterId);
 				console.log('CCPM DEBUG: Template order length:', tmpl.promptOrder.length);
 				console.log('CCPM DEBUG: Template order:', JSON.stringify(tmpl.promptOrder, null, 2));
@@ -948,7 +993,7 @@ class PromptTemplateManager {
 			console.log('CCPM: Template applied successfully:', tmpl.name);
 			return true;
 		} catch (error) {
-			console.error('CCPM: Failed to apply template:', error);
+			console.error('CCPM: Failed to apply template:' + (error?.message || error));
 			toastr.error('Failed to apply template: ' + error.message);
 			return false;
 		}
@@ -998,7 +1043,7 @@ class PromptTemplateManager {
 		// Capture the prompt order that's currently active/displayed
 		// Use promptManager.activeCharacter which reflects what's currently shown in the UI
 		let promptOrderToSave = [];
-		let activeCharacterId = null;
+		let activeCharacterId = GLOBAL_CHARACTER_ID;
 		if (promptManager && promptManager.activeCharacter) {
 			activeCharacterId = promptManager.activeCharacter.id;
 			console.log('CCPM DEBUG: Using promptManager.activeCharacter:', activeCharacterId);
@@ -1008,7 +1053,7 @@ class PromptTemplateManager {
 			console.log('CCPM DEBUG: Retrieved prompt order:', promptOrderToSave.length, 'items');
 			console.log('CCPM DEBUG: Order identifiers:', promptOrderToSave.map(e => e.identifier));
 		} else {
-			console.warn('CCPM: PromptManager or activeCharacter not available, prompt order will not be saved');
+			console.warn('CCPM: PromptManager or activeCharacter not available, using global character ID');
 		}
 
 		const result = this.createTemplate({
@@ -1026,72 +1071,33 @@ class PromptTemplateManager {
 	// Set up event handlers
 	setupEventHandlers() {
 		// Listen for settings updates to sync with external changes
-		eventSource.on(event_types.SETTINGS_UPDATED, () => {
-			this.handleSettingsUpdate();
-		});
+		eventSource.on(event_types.SETTINGS_UPDATED, this.boundHandlers.settingsUpdate);
 
 		// Listen for preset changes to potentially reapply locked templates
 		if (event_types.PRESET_CHANGED) {
-			eventSource.on(event_types.PRESET_CHANGED, () => {
-				this.handlePresetChange();
-			});
+			eventSource.on(event_types.PRESET_CHANGED, this.boundHandlers.presetChange);
 		}
 
 		// Listen for character changes to potentially auto-apply templates
-		eventSource.on(event_types.CHAT_CHANGED, () => {
-			this.handleChatChange();
-		});
+		eventSource.on(event_types.CHAT_CHANGED, this.boundHandlers.chatChange);
+
+		// Listen for connection profile changes to handle model locks
+		if (event_types.CONNECTION_PROFILE_LOADED) {
+			eventSource.on(event_types.CONNECTION_PROFILE_LOADED, this.boundHandlers.connectionProfileChange);
+		}
 
 		// Listen for extension settings loaded
-		eventSource.on(event_types.EXTENSION_SETTINGS_LOADED, () => {
-			this.handleExtensionSettingsLoaded();
-		});
+		eventSource.on(event_types.EXTENSION_SETTINGS_LOADED, this.boundHandlers.extensionSettingsLoaded);
 
 		// Listen for app ready to ensure proper initialization
-		eventSource.on(event_types.APP_READY, () => {
-			this.handleAppReady();
-		});
+		eventSource.on(event_types.APP_READY, this.boundHandlers.appReady);
 
 		// Initialize extension when SillyTavern is ready
 		eventSource.on(event_types.APP_READY, initializeExtension);
 
-		// Additional event handlers from SillyTavern-CharacterLocks
-		// Listen for group chat creation
-		eventSource.on(event_types.GROUP_CHAT_CREATED, () => {
-			this.handleGroupChatCreated();
-		});
-
-		// Listen for group member drafted (useful for group template management)
-		eventSource.on(event_types.GROUP_MEMBER_DRAFTED, (chId) => {
-			this.handleGroupMemberDrafted(chId);
-		});
-
 		// Listen for settings loaded after (more reliable than EXTENSION_SETTINGS_LOADED)
 		if (event_types.SETTINGS_LOADED_AFTER) {
-			eventSource.on(event_types.SETTINGS_LOADED_AFTER, () => {
-				this.handleSettingsLoadedAfter();
-			});
-		}
-
-		// Listen for character message rendered (useful for template context)
-		if (event_types.CHARACTER_MESSAGE_RENDERED) {
-			eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, () => {
-				this.handleCharacterMessageRendered();
-			});
-		}
-
-		// Listen for generation started (useful for template context tracking)
-		if (event_types.GENERATION_STARTED) {
-			eventSource.on(event_types.GENERATION_STARTED, () => {
-				this.handleGenerationStarted();
-			});
-		}
-
-		// Listen for generation ended
-		if (event_types.GENERATION_ENDED) {
-			eventSource.on(event_types.GENERATION_ENDED, () => {
-				this.handleGenerationEnded();
-			});
+			eventSource.on(event_types.SETTINGS_LOADED_AFTER, this.boundHandlers.settingsLoadedAfter);
 		}
 	}
 
@@ -1104,114 +1110,192 @@ class PromptTemplateManager {
 	}
 
 	async handlePresetChange() {
-		const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
+		try {
+			const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
 
-		if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
-			console.log('CCPM: Auto-apply disabled, skipping template reapplication');
-			return;
-		}
-
-		const effectiveLock = await this.getEffectiveLock();
-		if (!effectiveLock || !effectiveLock.templateId) {
-			console.log('CCPM: No locked template, skipping auto-apply');
-			return;
-		}
-
-		if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
-			const context = this.lockManager.chatContext.getCurrent();
-			const template = this.getTemplate(effectiveLock.templateId);
-			if (!template) return;
-
-			const contextType = context.isGroupChat ? 'group chat' : 'character';
-			const sourceName = context.isGroupChat ?
-				(context.groupName || 'Unnamed Group') :
-				(context.characterName || 'Unknown Character');
-
-			const popup = new Popup(`
-				<div class="flex-container flexFlowColumn flexGap10">
-					<h4>Preset Changed</h4>
-					<p>Reapply locked template "<strong>${escapeHtml(template.name)}</strong>" for ${contextType} "${escapeHtml(sourceName)}"?</p>
-					<p class="text_muted fontsize90p">This will restore the locked prompt configuration.</p>
-				</div>
-			`, POPUP_TYPE.CONFIRM, '', {
-				okButton: 'Apply',
-				cancelButton: 'Skip',
-				allowVerticalScrolling: true
-			});
-
-			const result = await popup.show();
-			if (result === POPUP_RESULT.AFFIRMATIVE) {
-				await this.applyTemplate(effectiveLock.templateId);
-				toastr.success(`Reapplied template: ${template.name}`);
+			if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
+				console.log('CCPM: Auto-apply disabled, skipping template reapplication');
+				return;
 			}
-		} else if (autoApplyMode === AUTO_APPLY_MODES.ALWAYS) {
-			const template = this.getTemplate(effectiveLock.templateId);
-			if (template) {
-				await this.applyTemplate(effectiveLock.templateId);
+
+			// Resolve conflicts (checks saved preference, shows dialog if needed)
+			const resolvedLock = await this.resolveConflictingLocks(autoApplyMode);
+			await refreshChatPreferenceInfoIfOpen(); // Refresh UI if popup is open
+			if (!resolvedLock || !resolvedLock.templateId) {
+				console.log('CCPM: No template selected for preset change');
+				return;
+			}
+
+			const template = this.getTemplate(resolvedLock.templateId);
+			if (!template) {
+				console.warn('CCPM: Locked template not found:', resolvedLock.templateId);
+				return;
+			}
+
+			if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
+				const context = this.lockManager.chatContext.getCurrent();
+				const contextType = context.isGroupChat ? 'group chat' : 'character';
+				const sourceName = context.isGroupChat ?
+					(context.groupName || 'Unnamed Group') :
+					(context.characterName || 'Unknown Character');
+
+				const popup = new Popup(`
+					<div class="flex-container flexFlowColumn flexGap10">
+						<h4>Preset Changed</h4>
+						<p>Reapply locked template "<strong>${escapeHtml(template.name)}</strong>" for ${contextType} "${escapeHtml(sourceName)}"?</p>
+						<p class="text_muted fontsize90p">This will restore the locked prompt configuration. Source: ${resolvedLock.source}</p>
+					</div>
+				`, POPUP_TYPE.CONFIRM, '', {
+					okButton: 'Apply',
+					cancelButton: 'Skip',
+					allowVerticalScrolling: true
+				});
+
+				const result = await popup.show();
+				if (result === POPUP_RESULT.AFFIRMATIVE) {
+					await this.applyTemplate(resolvedLock.templateId);
+					toastr.success(`Reapplied template: ${template.name}`);
+				}
+			} else if (autoApplyMode === AUTO_APPLY_MODES.ALWAYS) {
+				await this.applyTemplate(resolvedLock.templateId);
 				toastr.info(`Auto-reapplied template: ${template.name}`);
 			}
+		} catch (error) {
+			console.error('CCPM: Error in handlePresetChange:', error);
+			toastr.error('CCPM: Failed to handle preset change');
 		}
 	}
 
 	/**
 	 * Handle chat change event
 	 */
-	async handleChatChange() {
-		console.log('CCPM: Chat changed, templates available:', this.templates.size);
+	async handleConnectionProfileChange() {
+		try {
+			console.log('CCPM: Connection profile changed, reloading model locks');
 
-		// Invalidate context cache
-		this.lockManager.chatContext.invalidate();
+			// Invalidate context cache to pick up new profile name
+			this.lockManager.chatContext.invalidate();
 
-		// Load current locks
-		await this.lockManager.loadCurrentLocks();
+			// Load current locks (including updated model lock)
+			await this.lockManager.loadCurrentLocks();
 
-		// Apply locked template based on auto-apply mode
-		const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
+			// Apply locked template based on auto-apply mode
+			const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
 
-		if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
-			console.log('CCPM: Auto-apply disabled on chat change');
-			return;
-		}
-
-		const effectiveLock = await this.getEffectiveLock();
-		if (!effectiveLock || !effectiveLock.templateId) {
-			console.log('CCPM: No locked template for this chat');
-			return;
-		}
-
-		const template = this.getTemplate(effectiveLock.templateId);
-		if (!template) {
-			console.warn('CCPM: Locked template not found:', effectiveLock.templateId);
-			return;
-		}
-
-		if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
-			const context = this.lockManager.chatContext.getCurrent();
-			const contextType = context.isGroupChat ? 'group chat' : 'character';
-			const sourceName = context.isGroupChat ?
-				(context.groupName || 'Unnamed Group') :
-				(context.characterName || 'Unknown Character');
-
-			const popup = new Popup(`
-				<div class="flex-container flexFlowColumn flexGap10">
-					<h4>Chat Changed</h4>
-					<p>Apply locked template "<strong>${escapeHtml(template.name)}</strong>" for ${contextType} "${escapeHtml(sourceName)}"?</p>
-					<p class="text_muted fontsize90p">Source: ${effectiveLock.source}</p>
-				</div>
-			`, POPUP_TYPE.CONFIRM, '', {
-				okButton: 'Apply',
-				cancelButton: 'Skip',
-				allowVerticalScrolling: true
-			});
-
-			const result = await popup.show();
-			if (result === POPUP_RESULT.AFFIRMATIVE) {
-				await this.applyTemplate(effectiveLock.templateId);
-				toastr.success(`Applied template: ${template.name}`);
+			if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
+				console.log('CCPM: Auto-apply disabled on profile change');
+				return;
 			}
-		} else if (autoApplyMode === AUTO_APPLY_MODES.ALWAYS) {
-			await this.applyTemplate(effectiveLock.templateId);
-			toastr.info(`Auto-applied template: ${template.name}`);
+
+			// Resolve conflicts (checks saved preference, shows dialog if needed)
+			const resolvedLock = await this.resolveConflictingLocks(autoApplyMode);
+			await refreshChatPreferenceInfoIfOpen(); // Refresh UI if popup is open
+			if (!resolvedLock || !resolvedLock.templateId) {
+				console.log('CCPM: No template selected for this connection profile');
+				return;
+			}
+
+			const template = this.getTemplate(resolvedLock.templateId);
+			if (!template) {
+				console.warn('CCPM: Locked template not found:', resolvedLock.templateId);
+				return;
+			}
+
+			if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
+				const context = this.lockManager.chatContext.getCurrent();
+				const profileName = context.connectionProfileName || 'Current Profile';
+
+				const popup = new Popup(`
+					<div class="flex-container flexFlowColumn flexGap10">
+						<h4>Connection Profile Changed</h4>
+						<p>Apply locked template "<strong>${escapeHtml(template.name)}</strong>" for model "${escapeHtml(profileName)}"?</p>
+						<p class="text_muted fontsize90p">Source: ${resolvedLock.source}</p>
+					</div>
+				`, POPUP_TYPE.CONFIRM, '', {
+					okButton: 'Apply',
+					cancelButton: 'Skip',
+					allowVerticalScrolling: true
+				});
+
+				const result = await popup.show();
+				if (result === POPUP_RESULT.AFFIRMATIVE) {
+					await this.applyTemplate(resolvedLock.templateId);
+					toastr.success(`Applied template: ${template.name}`);
+				}
+			} else if (autoApplyMode === AUTO_APPLY_MODES.ALWAYS) {
+				console.log('CCPM: Auto-applying template:', template.name);
+				await this.applyTemplate(resolvedLock.templateId);
+				toastr.info(`Auto-applied template: ${template.name}`);
+			}
+		} catch (error) {
+			console.error('CCPM: Error in handleConnectionProfileChange:', error);
+			toastr.error('CCPM: Failed to handle connection profile change');
+		}
+	}
+
+	async handleChatChange() {
+		try {
+			console.log('CCPM: Chat changed, templates available:', this.templates.size);
+
+			// Invalidate context cache
+			this.lockManager.chatContext.invalidate();
+
+			// Load current locks
+			await this.lockManager.loadCurrentLocks();
+
+			// Apply locked template based on auto-apply mode
+			const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
+
+			if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
+				console.log('CCPM: Auto-apply disabled on chat change');
+				return;
+			}
+
+			// Resolve conflicts (checks saved preference, shows dialog if needed)
+			const resolvedLock = await this.resolveConflictingLocks(autoApplyMode);
+			await refreshChatPreferenceInfoIfOpen(); // Refresh UI if popup is open
+			if (!resolvedLock || !resolvedLock.templateId) {
+				console.log('CCPM: No template selected for this chat');
+				return;
+			}
+
+			const template = this.getTemplate(resolvedLock.templateId);
+			if (!template) {
+				console.warn('CCPM: Locked template not found:', resolvedLock.templateId);
+				return;
+			}
+
+			if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
+				const context = this.lockManager.chatContext.getCurrent();
+				const contextType = context.isGroupChat ? 'group chat' : 'character';
+				const sourceName = context.isGroupChat ?
+					(context.groupName || 'Unnamed Group') :
+					(context.characterName || 'Unknown Character');
+
+				const popup = new Popup(`
+					<div class="flex-container flexFlowColumn flexGap10">
+						<h4>Chat Changed</h4>
+						<p>Apply locked template "<strong>${escapeHtml(template.name)}</strong>" for ${contextType} "${escapeHtml(sourceName)}"?</p>
+						<p class="text_muted fontsize90p">Source: ${resolvedLock.source}</p>
+					</div>
+				`, POPUP_TYPE.CONFIRM, '', {
+					okButton: 'Apply',
+					cancelButton: 'Skip',
+					allowVerticalScrolling: true
+				});
+
+				const result = await popup.show();
+				if (result === POPUP_RESULT.AFFIRMATIVE) {
+					await this.applyTemplate(resolvedLock.templateId);
+					toastr.success(`Applied template: ${template.name}`);
+				}
+			} else if (autoApplyMode === AUTO_APPLY_MODES.ALWAYS) {
+				await this.applyTemplate(resolvedLock.templateId);
+				toastr.info(`Auto-applied template: ${template.name}`);
+			}
+		} catch (error) {
+			console.error('CCPM: Error in handleChatChange:', error);
+			toastr.error('CCPM: Failed to handle chat change');
 		}
 	}
 
@@ -1233,54 +1317,12 @@ class PromptTemplateManager {
 	}
 
 	/**
-	 * Handle group chat creation event
-	 */
-	handleGroupChatCreated() {
-		// Could implement group-specific template logic
-		console.log('CCPM: Group chat created, templates available:', this.templates.size);
-	}
-
-	/**
-	 * Handle group member drafted event
-	 * @param {number} chId - Character ID that was drafted
-	 */
-	handleGroupMemberDrafted(chId) {
-		// Could implement character-specific template application in groups
-		console.log('CCPM: Group member drafted, chId:', chId);
-		// Future: Apply character-specific templates when generating for that character
-	}
-
-	/**
 	 * Handle settings loaded after event (more reliable initialization)
 	 */
 	handleSettingsLoadedAfter() {
 		this.loadTemplatesFromSettings();
 		this.ensureUIInjected();
 		console.log('CCPM: Settings loaded after, templates:', this.templates.size);
-	}
-
-	/**
-	 * Handle character message rendered event
-	 */
-	handleCharacterMessageRendered() {
-		// Could implement context-aware template suggestions
-		console.log('CCPM: Character message rendered');
-	}
-
-	/**
-	 * Handle generation started event
-	 */
-	handleGenerationStarted() {
-		// Could implement pre-generation template checks
-		console.log('CCPM: Generation started');
-	}
-
-	/**
-	 * Handle generation ended event
-	 */
-	handleGenerationEnded() {
-		// Could implement post-generation template analysis
-		console.log('CCPM: Generation ended');
 	}
 
 	/**
@@ -1300,14 +1342,14 @@ class PromptTemplateManager {
 	 */
 	async applyLockedTemplate() {
 		try {
-			const lockResult = await this.lockManager.getLockToApply();
+			const lockResult = await this.lockManager.getEffectiveLock();
 			if (lockResult.templateId) {
 				console.log(`CCPM: Applying locked template from ${lockResult.source}:`, lockResult.templateId);
 				return await this.applyTemplate(lockResult.templateId);
 			}
 			return false;
 		} catch (error) {
-			toastr.error('CCPM: Error applying locked template:', error);
+			toastr.error('CCPM: Error applying locked template: ' + (error?.message || error));
 			return false;
 		}
 	}
@@ -1318,7 +1360,7 @@ class PromptTemplateManager {
 	 */
 	async askToApplyLockedTemplate() {
 		try {
-			const lockResult = await this.lockManager.getLockToApply();
+			const lockResult = await this.lockManager.getEffectiveLock();
 			if (!lockResult.templateId) {
 				return false;
 			}
@@ -1349,7 +1391,7 @@ class PromptTemplateManager {
 			});
 
 			const result = await popup.show();
-			if (result) {
+			if (result === POPUP_RESULT.AFFIRMATIVE) {
 				console.log(`CCPM: User chose to apply locked template from ${lockResult.source}:`, lockResult.templateId);
 				const success = await this.applyTemplate(lockResult.templateId);
 				if (success) {
@@ -1361,7 +1403,7 @@ class PromptTemplateManager {
 				return false;
 			}
 		} catch (error) {
-			toastr.error('CCPM: Error asking to apply locked template:', error);
+			toastr.error('CCPM: Error asking to apply locked template: ' + (error?.message || error));
 			return false;
 		}
 	}
@@ -1375,7 +1417,7 @@ class PromptTemplateManager {
 	async lockTemplate(templateId, target) {
 		const template = this.getTemplate(templateId);
 		if (!template) {
-			toastr.error('CCPM: Cannot lock template - template not found:', templateId);
+			toastr.error('CCPM: Cannot lock template - template not found: ' + templateId);
 			return false;
 		}
 
@@ -1385,7 +1427,6 @@ class PromptTemplateManager {
 			toastr.success(`Template locked to ${target}`, 'CCPM');
 		} else {
 			toastr.error(`CCPM: Failed to lock template to ${target}`);
-			toastr.error(`Failed to lock template to ${target}`, 'CCPM');
 		}
 		return success;
 	}
@@ -1417,11 +1458,99 @@ class PromptTemplateManager {
 
 	/**
 	 * Get the template that would be applied based on current context
+	 * Uses saved chat preference if available, otherwise returns first lock
 	 * @returns {Object|null} Lock result with templateId and source
 	 */
 	async getEffectiveLock() {
-		await this.lockManager.loadCurrentLocks();
-		return this.lockManager.getLockToApply();
+		const locks = await this.getCurrentLocks();
+
+		// Filter to only locks that have values
+		const activeLocks = Object.entries(locks).filter(([source, templateId]) => templateId);
+
+		if (activeLocks.length === 0) {
+			return { templateId: null, source: 'none' };
+		}
+
+		if (activeLocks.length === 1) {
+			// No conflict, return the only lock
+			return {
+				templateId: activeLocks[0][1],
+				source: activeLocks[0][0]
+			};
+		}
+
+		// Multiple locks exist - check for saved preference
+		const savedPreference = this.lockManager.storage.getChatPreferredLockSource();
+
+		if (savedPreference && locks[savedPreference]) {
+			// Saved preference is still valid, use it
+			return {
+				templateId: locks[savedPreference],
+				source: savedPreference
+			};
+		}
+
+		// No saved preference, return first lock for display purposes
+		return {
+			templateId: activeLocks[0][1],
+			source: `${activeLocks[0][0]} (first available)`
+		};
+	}
+
+	/**
+	 * Resolve lock conflicts - checks saved preference first, then shows dialog if needed
+	 * @param {string} autoApplyMode - The current auto-apply mode
+	 * @returns {Promise<{templateId: string, source: string} | null>} Selected lock or null if cancelled
+	 */
+	async resolveConflictingLocks(autoApplyMode) {
+		const locks = await this.getCurrentLocks();
+		const context = this.lockManager.chatContext.getCurrent();
+
+		// Filter to only locks that have values
+		const activeLocks = Object.entries(locks).filter(([source, templateId]) => templateId);
+
+		if (activeLocks.length === 0) {
+			return null;
+		}
+
+		if (activeLocks.length === 1) {
+			// No conflict, return the only lock
+			return {
+				templateId: activeLocks[0][1],
+				source: activeLocks[0][0]
+			};
+		}
+
+		// Multiple locks exist - check for saved preference
+		const savedPreference = this.lockManager.storage.getChatPreferredLockSource();
+
+		if (savedPreference && locks[savedPreference]) {
+			// Saved preference is still valid, use it
+			console.log(`CCPM: Using saved preference: ${savedPreference}`);
+			return {
+				templateId: locks[savedPreference],
+				source: savedPreference
+			};
+		}
+
+		// No valid saved preference, show choice dialog
+		const choice = await showConflictResolutionDialog(locks, context, autoApplyMode);
+
+		if (!choice) {
+			// User cancelled
+			return null;
+		}
+
+		// Save preference if requested
+		if (choice.rememberChoice) {
+			this.lockManager.storage.setChatPreferredLockSource(choice.source);
+			console.log(`CCPM: Saved preference: ${choice.source}`);
+		}
+
+		return {
+			templateId: locks[choice.source],
+			source: choice.source
+		};
 	}
 
 	/**
@@ -1429,29 +1558,22 @@ class PromptTemplateManager {
 	 */
 	cleanup() {
 		// Core event handlers
-		eventSource.off(event_types.SETTINGS_UPDATED, this.handleSettingsUpdate);
-		eventSource.off(event_types.CHAT_CHANGED, this.handleChatChange);
-		eventSource.off(event_types.EXTENSION_SETTINGS_LOADED, this.handleExtensionSettingsLoaded);
-		eventSource.off(event_types.APP_READY, this.handleAppReady);
+		eventSource.off(event_types.SETTINGS_UPDATED, this.boundHandlers.settingsUpdate);
+		eventSource.off(event_types.CHAT_CHANGED, this.boundHandlers.chatChange);
+		eventSource.off(event_types.EXTENSION_SETTINGS_LOADED, this.boundHandlers.extensionSettingsLoaded);
+		eventSource.off(event_types.APP_READY, this.boundHandlers.appReady);
+		eventSource.off(event_types.APP_READY, initializeExtension);
 
-		// Additional event handlers from SillyTavern-CharacterLocks
-		eventSource.off(event_types.GROUP_CHAT_CREATED, this.handleGroupChatCreated);
-		eventSource.off(event_types.GROUP_MEMBER_DRAFTED, this.handleGroupMemberDrafted);
+		if (event_types.PRESET_CHANGED) {
+			eventSource.off(event_types.PRESET_CHANGED, this.boundHandlers.presetChange);
+		}
+
+		if (event_types.CONNECTION_PROFILE_LOADED) {
+			eventSource.off(event_types.CONNECTION_PROFILE_LOADED, this.boundHandlers.connectionProfileChange);
+		}
 
 		if (event_types.SETTINGS_LOADED_AFTER) {
-			eventSource.off(event_types.SETTINGS_LOADED_AFTER, this.handleSettingsLoadedAfter);
-		}
-
-		if (event_types.CHARACTER_MESSAGE_RENDERED) {
-			eventSource.off(event_types.CHARACTER_MESSAGE_RENDERED, this.handleCharacterMessageRendered);
-		}
-
-		if (event_types.GENERATION_STARTED) {
-			eventSource.off(event_types.GENERATION_STARTED, this.handleGenerationStarted);
-		}
-
-		if (event_types.GENERATION_ENDED) {
-			eventSource.off(event_types.GENERATION_ENDED, this.handleGenerationEnded);
+			eventSource.off(event_types.SETTINGS_LOADED_AFTER, this.boundHandlers.settingsLoadedAfter);
 		}
 	}
 }
@@ -1494,6 +1616,7 @@ function openPromptTemplateManagerModal() {
 		<div class="title_restorable">
 			<h3>Prompt Template Manager</h3>
 		</div>
+		<div id="ccpm-chat-preference-info" class="marginBot10"></div>
 		<div class="flex-container alignItemsCenter marginBot10" style="padding-bottom: 10px; border-bottom: 1px solid var(--SmartThemeBorderColor);">
 			<div class="menu_button menu_button_icon interactable" id="ccpm-create-from-current">
 				<i class="fa-solid fa-plus"></i>
@@ -1519,6 +1642,7 @@ function openPromptTemplateManagerModal() {
 		large: true,
 		allowVerticalScrolling: true,
 		onOpen: () => {
+			renderChatPreferenceInfo();
 			renderPromptTemplateList();
 			setupTemplateManagerEvents();
 		},
@@ -1528,6 +1652,75 @@ function openPromptTemplateManagerModal() {
 		},
 	});
 	ccpmMainPopup.show();
+}
+
+// Helper function to refresh preference info if popup is open
+async function refreshChatPreferenceInfoIfOpen() {
+	if (ccpmMainPopup) {
+		await renderChatPreferenceInfo();
+	}
+}
+
+async function renderChatPreferenceInfo() {
+	const infoDiv = document.getElementById('ccpm-chat-preference-info');
+	if (!infoDiv) return;
+
+	const preferredSource = promptTemplateManager.lockManager.storage.getChatPreferredLockSource();
+	const context = promptTemplateManager.lockManager.chatContext.getCurrent();
+
+	if (!preferredSource) {
+		infoDiv.innerHTML = '';
+		return;
+	}
+
+	// Get current locks to show what template is associated with the preference
+	const currentLocks = await promptTemplateManager.getCurrentLocks();
+	const preferredTemplateId = currentLocks[preferredSource];
+	const preferredTemplate = preferredTemplateId ? promptTemplateManager.getTemplate(preferredTemplateId) : null;
+
+	// Build context name for display
+	let contextName = '';
+	switch (preferredSource) {
+		case 'character':
+			contextName = context.characterName || 'Character';
+			break;
+		case 'chat':
+			contextName = 'Chat';
+			break;
+		case 'group':
+			contextName = context.groupName || 'Group';
+			break;
+		case 'model':
+			contextName = context.connectionProfileName || 'Model';
+			break;
+	}
+
+	infoDiv.innerHTML = `
+		<div class="text_pole padding10" style="background-color: var(--black30a); border-left: 3px solid var(--SmartThemeQuoteColor);">
+			<div class="flex-container spaceBetween alignItemsCenter">
+				<div class="flexGrow">
+					<div class="fontsize90p">
+						<strong>This chat prefers:</strong> ${escapeHtml(preferredSource)} locks
+						${preferredTemplate ? `(currently: "<span class="toggleEnabled">${escapeHtml(preferredTemplate.name)}</span>")` : '(no lock set)'}
+					</div>
+					<div class="fontsize80p text_muted marginTop5">
+						When multiple locks exist, ${escapeHtml(preferredSource)} lock from "${escapeHtml(contextName)}" will be applied.
+					</div>
+				</div>
+				<div class="menu_button menu_button_icon interactable" id="ccpm-clear-chat-preference" title="Clear this preference">
+					<i class="fa-solid fa-times"></i>
+					<span>Clear</span>
+				</div>
+			</div>
+		</div>
+	`;
+
+	// Add event listener for clear button
+	document.getElementById('ccpm-clear-chat-preference')?.addEventListener('click', async () => {
+		promptTemplateManager.lockManager.storage.deleteChatPreferredLockSource();
+		toastr.info('Chat preference cleared');
+		await renderChatPreferenceInfo();
+	});
 }
 
 async function renderPromptTemplateList() {
@@ -1559,16 +1752,18 @@ async function renderPromptTemplateList() {
 		const isLockedToCharacter = currentLocks.character === t.id;
 		const isLockedToChat = currentLocks.chat === t.id;
 		const isLockedToGroup = currentLocks.group === t.id;
+		const isLockedToModel = currentLocks.model === t.id;
 		const isEffectiveTemplate = effectiveLock.templateId === t.id;
 
 		let lockStatus = '';
 		if (isEffectiveTemplate) {
 			lockStatus = `<span class="fontsize80p toggleEnabled" title="Currently active from ${effectiveLock.source}">🔒 Active (${effectiveLock.source})</span>`;
-		} else if (isLockedToCharacter || isLockedToChat || isLockedToGroup) {
+		} else if (isLockedToCharacter || isLockedToChat || isLockedToGroup || isLockedToModel) {
 			const lockTypes = [];
 			if (isLockedToCharacter) lockTypes.push('character');
 			if (isLockedToChat) lockTypes.push('chat');
 			if (isLockedToGroup) lockTypes.push('group');
+			if (isLockedToModel) lockTypes.push('model');
 			lockStatus = `<span class="fontsize80p text_muted" title="Locked to: ${lockTypes.join(', ')}">🔒 ${lockTypes.join(', ')}</span>`;
 		}
 
@@ -1588,19 +1783,19 @@ async function renderPromptTemplateList() {
 						</div>
 					</div>
 					<div class="flex-container flexGap2">
-						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmApplyTemplate('${t.id}')" title="Apply Template" style="width: 32px; height: 32px; padding: 0;">
+						<div class="menu_button menu_button_icon interactable" onclick="CCPM.applyTemplate('${t.id}')" title="Apply Template" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-play"></i>
 						</div>
-						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmViewPrompts('${t.id}')" title="View/Edit Prompts" style="width: 32px; height: 32px; padding: 0;">
+						<div class="menu_button menu_button_icon interactable" onclick="CCPM.viewPrompts('${t.id}')" title="View/Edit Prompts" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-pencil"></i>
 						</div>
-						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmShowLockMenu('${t.id}')" title="Lock/Unlock Template" style="width: 32px; height: 32px; padding: 0;">
+						<div class="menu_button menu_button_icon interactable" onclick="CCPM.showLockMenu('${t.id}')" title="Lock/Unlock Template" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-lock"></i>
 						</div>
-						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmEditTemplate('${t.id}')" title="Edit Template Name/Description" style="width: 32px; height: 32px; padding: 0;">
+						<div class="menu_button menu_button_icon interactable" onclick="CCPM.editTemplate('${t.id}')" title="Edit Template Name/Description" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-edit"></i>
 						</div>
-						<div class="menu_button menu_button_icon interactable redOverlayGlow" onclick="window.ccpmDeleteTemplate('${t.id}')" title="Delete Template" style="width: 32px; height: 32px; padding: 0;">
+						<div class="menu_button menu_button_icon interactable redOverlayGlow" onclick="CCPM.deleteTemplate('${t.id}')" title="Delete Template" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-trash"></i>
 						</div>
 					</div>
@@ -1636,8 +1831,11 @@ function setupTemplateManagerEvents() {
 // Store reference to the main template manager popup
 let ccpmMainPopup = null;
 
+// Create namespace for CCPM functions
+window.CCPM = window.CCPM || {};
+
 // Expose template management functions for buttons
-window.ccpmApplyTemplate = async function(id) {
+window.CCPM.applyTemplate = async function(id) {
 	if (await promptTemplateManager.applyTemplate(id)) {
 		toastr.success('Template applied successfully!');
 		// Close the main popup properly using complete() to trigger proper cleanup
@@ -1649,7 +1847,7 @@ window.ccpmApplyTemplate = async function(id) {
 	}
 };
 
-window.ccpmEditTemplate = async function(id) {
+window.CCPM.editTemplate = async function(id) {
 	const template = promptTemplateManager.getTemplate(id);
 	if (!template) {
 		toastr.error('Template not found');
@@ -1658,7 +1856,7 @@ window.ccpmEditTemplate = async function(id) {
 	await showEditTemplateDialog(template);
 };
 
-window.ccpmDeleteTemplate = async function(id) {
+window.CCPM.deleteTemplate = async function(id) {
 	const template = promptTemplateManager.getTemplate(id);
 	if (!template) {
 		toastr.error('Template not found');
@@ -1682,7 +1880,7 @@ window.ccpmDeleteTemplate = async function(id) {
 	});
 
 	const result = await popup.show();
-	if (result) {
+	if (result === POPUP_RESULT.AFFIRMATIVE) {
 		if (promptTemplateManager.deleteTemplate(id)) {
 			toastr.success('Template deleted successfully');
 			await renderPromptTemplateList();
@@ -1692,7 +1890,7 @@ window.ccpmDeleteTemplate = async function(id) {
 	}
 };
 
-window.ccpmShowLockMenu = async function(templateId) {
+window.CCPM.showLockMenu = async function(templateId) {
 	const template = promptTemplateManager.getTemplate(templateId);
 	if (!template) {
 		toastr.error('Template not found');
@@ -1713,11 +1911,11 @@ window.ccpmShowLockMenu = async function(templateId) {
 	if (context.isGroupChat && context.groupId) {
 		availableTargets.push('group');
 	}
+	if (context.connectionProfileName) {
+		availableTargets.push('model');
+	}
 
 	const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
-	const preferCharacterOverChat = extension_settings.ccPromptManager?.preferCharacterOverChat ?? true;
-	const preferGroupOverChat = extension_settings.ccPromptManager?.preferGroupOverChat ?? true;
-	const preferIndividualCharacterInGroup = extension_settings.ccPromptManager?.preferIndividualCharacterInGroup ?? false;
 
 	const content = document.createElement('div');
 	content.innerHTML = `
@@ -1736,7 +1934,7 @@ window.ccpmShowLockMenu = async function(templateId) {
 							<input type="checkbox"
 								id="ccpm-lock-${target}"
 								${isCurrentlyLocked ? 'checked' : ''}
-								onchange="if(this.checked) { ccpmLockToTarget('${templateId}', '${target}'); } else { ccpmClearLock('${target}'); }">
+								onchange="if(this.checked) { CCPM.lockToTarget('${templateId}', '${target}'); } else { CCPM.clearLock('${target}'); }">
 							<span>
 								<strong>${target.charAt(0).toUpperCase() + target.slice(1)}</strong>
 								${contextName ? ` - <small class="text_muted">${escapeHtml(contextName)}</small>` : ''}
@@ -1755,43 +1953,18 @@ window.ccpmShowLockMenu = async function(templateId) {
 				<h4>⚙️ Auto-apply when preset changes:</h4>
 				<div class="marginTop10">
 					<label class="radio_label">
-						<input type="radio" name="ccpm-auto-apply-mode" value="${AUTO_APPLY_MODES.NEVER}" ${autoApplyMode === AUTO_APPLY_MODES.NEVER ? 'checked' : ''} onchange="window.ccpmSetAutoApplyMode('${AUTO_APPLY_MODES.NEVER}')">
+						<input type="radio" name="ccpm-auto-apply-mode" value="${AUTO_APPLY_MODES.NEVER}" ${autoApplyMode === AUTO_APPLY_MODES.NEVER ? 'checked' : ''} onchange="CCPM.setAutoApplyMode('${AUTO_APPLY_MODES.NEVER}')">
 						<span>Never - Don't reapply locked templates</span>
 					</label>
 					<label class="radio_label">
-						<input type="radio" name="ccpm-auto-apply-mode" value="${AUTO_APPLY_MODES.ASK}" ${autoApplyMode === AUTO_APPLY_MODES.ASK ? 'checked' : ''} onchange="window.ccpmSetAutoApplyMode('${AUTO_APPLY_MODES.ASK}')">
+						<input type="radio" name="ccpm-auto-apply-mode" value="${AUTO_APPLY_MODES.ASK}" ${autoApplyMode === AUTO_APPLY_MODES.ASK ? 'checked' : ''} onchange="CCPM.setAutoApplyMode('${AUTO_APPLY_MODES.ASK}')">
 						<span>Ask - Prompt before applying locked templates</span>
 					</label>
 					<label class="radio_label">
-						<input type="radio" name="ccpm-auto-apply-mode" value="${AUTO_APPLY_MODES.ALWAYS}" ${autoApplyMode === AUTO_APPLY_MODES.ALWAYS ? 'checked' : ''} onchange="window.ccpmSetAutoApplyMode('${AUTO_APPLY_MODES.ALWAYS}')">
+						<input type="radio" name="ccpm-auto-apply-mode" value="${AUTO_APPLY_MODES.ALWAYS}" ${autoApplyMode === AUTO_APPLY_MODES.ALWAYS ? 'checked' : ''} onchange="CCPM.setAutoApplyMode('${AUTO_APPLY_MODES.ALWAYS}')">
 						<span>Always - Automatically apply locked templates</span>
 					</label>
 				</div>
-			</div>
-
-			<hr>
-
-			<div class="completion_prompt_manager_popup_entry_form_control">
-				<h4>⚙️ Lock Priority:</h4>
-				${context.isGroupChat ? `
-					<div class="marginTop10">
-						<label class="checkbox_label">
-							<input type="checkbox" id="ccpm-pref-group-over-chat" ${preferGroupOverChat ? 'checked' : ''} onchange="window.ccpmSetPriority('preferGroupOverChat', this.checked)">
-							<span>Prefer group settings over chat</span>
-						</label>
-						<label class="checkbox_label">
-							<input type="checkbox" id="ccpm-pref-individual-char" ${preferIndividualCharacterInGroup ? 'checked' : ''} onchange="window.ccpmSetPriority('preferIndividualCharacterInGroup', this.checked)">
-							<span>Prefer character settings over group or chat</span>
-						</label>
-					</div>
-				` : `
-					<div class="marginTop10">
-						<label class="checkbox_label">
-							<input type="checkbox" id="ccpm-pref-char-over-chat" ${preferCharacterOverChat ? 'checked' : ''} onchange="window.ccpmSetPriority('preferCharacterOverChat', this.checked)">
-							<span>Prefer character settings over chat</span>
-						</label>
-					</div>
-				`}
 			</div>
 		</div>
 	`;
@@ -1817,12 +1990,14 @@ function getContextName(context, target) {
 			}
 		case 'group':
 			return context.groupName || 'Current Group';
+		case 'model':
+			return context.connectionProfileName || 'Current Model';
 		default:
 			return '';
 	}
 }
 
-window.ccpmLockToTarget = async function(templateId, target) {
+window.CCPM.lockToTarget = async function(templateId, target) {
 	const success = await promptTemplateManager.lockTemplate(templateId, target);
 	if (success) {
 		// The lock menu popup will close itself via its cancelButton
@@ -1831,7 +2006,7 @@ window.ccpmLockToTarget = async function(templateId, target) {
 	}
 };
 
-window.ccpmClearLock = async function(target) {
+window.CCPM.clearLock = async function(target) {
 	const success = await promptTemplateManager.clearTemplateLock(target);
 	if (success) {
 		// The lock menu popup will close itself via its cancelButton
@@ -1840,19 +2015,13 @@ window.ccpmClearLock = async function(target) {
 	}
 };
 
-window.ccpmSetAutoApplyMode = function(mode) {
+window.CCPM.setAutoApplyMode = function(mode) {
 	extension_settings.ccPromptManager.autoApplyMode = mode;
 	saveSettingsDebounced();
 	console.log('CCPM: Auto-apply mode set to:', mode);
 };
 
-window.ccpmSetPriority = function(preference, value) {
-	extension_settings.ccPromptManager[preference] = value;
-	saveSettingsDebounced();
-	console.log('CCPM: Priority preference set:', preference, '=', value);
-};
-
-window.ccpmViewPrompts = async function(templateId) {
+window.CCPM.viewPrompts = async function(templateId) {
 	const template = promptTemplateManager.getTemplate(templateId);
 	if (!template) {
 		toastr.error('Template not found');
@@ -1986,7 +2155,7 @@ ${escapeHtml(prompt.content || '(empty)')}
 					e.preventDefault();
 					e.stopPropagation();
 					const identifier = btn.dataset.identifier;
-					ccpmEditPromptInTemplate(templateId, identifier);
+					CCPM.editPromptInTemplate(templateId, identifier);
 				});
 			});
 
@@ -2032,7 +2201,7 @@ ${escapeHtml(prompt.content || '(empty)')}
 /**
  * Edit a prompt within a template using ST's existing edit form
  */
-window.ccpmEditPromptInTemplate = async function(templateId, promptIdentifier) {
+window.CCPM.editPromptInTemplate = async function(templateId, promptIdentifier) {
 	const template = promptTemplateManager.getTemplate(templateId);
 	if (!template) {
 		toastr.error('Template not found');
@@ -2137,7 +2306,7 @@ window.ccpmEditPromptInTemplate = async function(templateId, promptIdentifier) {
 
 	const result = await editPopup.show();
 
-	if (result && savedData) {
+	if (result === POPUP_RESULT.AFFIRMATIVE && savedData) {
 		// Update the prompt in the template
 		Object.assign(template.prompts[promptIdentifier], savedData);
 		template.updatedAt = new Date().toISOString();
@@ -2145,9 +2314,116 @@ window.ccpmEditPromptInTemplate = async function(templateId, promptIdentifier) {
 		toastr.success('Prompt updated in template');
 
 		// Refresh the viewer
-		await window.ccpmViewPrompts(templateId);
+		await CCPM.viewPrompts(templateId);
 	}
 };
+
+async function showConflictResolutionDialog(locks, context, autoApplyMode) {
+	// Filter to only locks that have values
+	const availableLocks = Object.entries(locks).filter(([source, templateId]) => templateId);
+
+	if (availableLocks.length === 0) {
+		return null;
+	}
+
+	if (availableLocks.length === 1) {
+		// No conflict, return the only lock
+		return { source: availableLocks[0][0], rememberChoice: false };
+	}
+
+	// Build lock options with template names
+	const lockOptions = await Promise.all(availableLocks.map(async ([source, templateId]) => {
+		const template = promptTemplateManager.getTemplate(templateId);
+		let contextName = '';
+
+		switch (source) {
+			case 'character':
+				contextName = context.characterName || 'Character';
+				break;
+			case 'chat':
+				contextName = 'Chat';
+				break;
+			case 'group':
+				contextName = context.groupName || 'Group';
+				break;
+			case 'model':
+				contextName = context.connectionProfileName || 'Model';
+				break;
+		}
+
+		return {
+			source,
+			templateId,
+			templateName: template ? template.name : 'Unknown Template',
+			contextName
+		};
+	}));
+
+	// Build dialog content
+	const content = document.createElement('div');
+	content.innerHTML = `
+		<div class="flex-container flexFlowColumn flexGap10">
+			<h4>Multiple Templates Locked</h4>
+			${autoApplyMode === AUTO_APPLY_MODES.ALWAYS ? `
+				<p class="text_muted fontsize90p">
+					<i class="fa-solid fa-info-circle"></i> Auto-apply is enabled, but multiple templates are locked. Please choose which one to apply.
+				</p>
+			` : ''}
+			<p>Multiple templates are locked for this context. Choose which one to apply:</p>
+			<div class="flex-container flexFlowColumn flexGap5" id="ccpm-lock-options">
+				${lockOptions.map((opt, idx) => `
+					<label class="checkbox_label">
+						<input type="radio" name="ccpm-lock-choice" value="${escapeHtml(opt.source)}" ${idx === 0 ? 'checked' : ''}>
+						<span>
+							<strong>${escapeHtml(opt.source)}</strong> (${escapeHtml(opt.contextName)}):
+							"<span class="toggleEnabled">${escapeHtml(opt.templateName)}</span>"
+						</span>
+					</label>
+				`).join('')}
+			</div>
+			<div class="marginTop10" style="border-top: 1px solid var(--SmartThemeBorderColor); padding-top: 10px;">
+				<label class="checkbox_label">
+					<input type="checkbox" id="ccpm-remember-choice">
+					<span>Remember this choice for this chat</span>
+				</label>
+				<div class="fontsize80p text_muted marginTop5">
+					Future conflicts will automatically use your preferred lock source.
+				</div>
+			</div>
+		</div>
+	`;
+
+	let capturedData = null;
+	const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
+		okButton: 'Apply Selected',
+		cancelButton: 'Cancel',
+		onClosing: (popup) => {
+			if (popup.result === POPUP_RESULT.AFFIRMATIVE) {
+				const selectedRadio = content.querySelector('input[name="ccpm-lock-choice"]:checked');
+				const rememberCheckbox = content.querySelector('#ccpm-remember-choice');
+
+				if (!selectedRadio) {
+					toastr.error('Please select a template');
+					return false;
+				}
+
+				capturedData = {
+					source: selectedRadio.value,
+					rememberChoice: rememberCheckbox?.checked || false
+				};
+			}
+			return true;
+		}
+	});
+
+	const result = await popup.show();
+
+	if (result === POPUP_RESULT.AFFIRMATIVE && capturedData) {
+		return capturedData;
+	}
+
+	return null;
+}
 
 async function showCreateTemplateDialog() {
 	const availablePrompts = oai_settings.prompts || [];
@@ -2235,7 +2511,7 @@ async function showCreateTemplateDialog() {
 	const result = await popup.show();
 	console.log('CCPM DEBUG: Popup result:', result);
 
-	if (!result || !capturedData) {
+	if (result !== POPUP_RESULT.AFFIRMATIVE || !capturedData) {
 		console.log('CCPM DEBUG: User cancelled or no data captured');
 		return;
 	}
@@ -2255,7 +2531,7 @@ async function showCreateTemplateDialog() {
 		toastr.success('Template created successfully');
 		await renderPromptTemplateList();
 	} catch (error) {
-		console.error('CCPM DEBUG: Error creating template:', error);
+		console.error('CCPM DEBUG: Error creating template:' + (error?.message || error));
 		toastr.error('Failed to create template: ' + error.message);
 	}
 }
@@ -2298,7 +2574,7 @@ async function showEditTemplateDialog(template) {
 	});
 
 	const result = await popup.show();
-	if (!result || !capturedData) return;
+	if (result !== POPUP_RESULT.AFFIRMATIVE || !capturedData) return;
 
 	try {
 		promptTemplateManager.updateTemplate(template.id, capturedData);
