@@ -1,13 +1,13 @@
 # 📂 CCPromptManager (CCPM Extension for SillyTavern)
 
-Advanced prompt template management extension for SillyTavern. Create, save, and lock prompt configurations per character, chat, or group with automatic reapplication on preset or character changes.
+Advanced chat completion prompt template management extension for SillyTavern. Create, save, and lock prompt configurations per character, chat, or group with automatic reapplication on preset or character changes.
 
 📋 **[View Changelog](CHANGELOG.md)** for detailed version history and updates.
 
 ## FAQ 
 The extension is located in the Extensions menu (the magic wand 🪄 to the left of your input box). Look for the top item, "📂 Prompt Templates".
 
-[Find it here!](https://github.com/aikohanasaki/imagehost/blob/main/prompt-templates.png)
+![CCPM settings location](https://github.com/aikohanasaki/imagehost/blob/main/prompt-templates.png)
 
 ## Features
 
