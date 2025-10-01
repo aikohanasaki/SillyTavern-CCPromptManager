@@ -66,3 +66,14 @@
     font-style: italic;
     cursor: default;
 }
+
+/* CCPM template indicator in ST's prompt manager */
+.ccpm-template-indicator {
+    padding: 5px 10px;
+    text-align: center;
+    font-size: 0.9em;
+}
+
+.ccpm-template-indicator .fa-file-lines {
+    margin-right: 3px;
+}

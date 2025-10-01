@@ -1,10 +1,10 @@
 import { Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
-import { extension_settings, getContext } from '../../../extensions.js';
+import { extension_settings, getContext, saveMetadataDebounced } from '../../../extensions.js';
 import { eventSource, event_types, chat_metadata, name2, systemUserName, neutralCharacterName, characters, saveSettingsDebounced } from '../../../../script.js';
 import { power_user } from '../../../power-user.js';
 import { oai_settings, promptManager } from '../../../openai.js';
 import { selected_group, groups, editGroup } from '../../../group-chats.js';
-import { escapeHtml } from '../../../utils.js';
+import { escapeHtml, debounce } from '../../../utils.js';
 
 const MODULE_NAME = 'CCPM';
 const CACHE_TTL = 1000;
@@ -27,8 +27,58 @@ const AUTO_APPLY_MODES = {
     ALWAYS: 'always'
 };
 
+const LOCKING_MODES = {
+    CHARACTER: 'character',
+    MODEL: 'model'
+};
+
 // Utility functions
 const getCurrentChatMetadata = () => chat_metadata;
+
+/**
+ * Inject current CCPM template name into ST's prompt manager UI
+ */
+function injectTemplateNameIntoPromptManager() {
+	if (!promptTemplateManager) return;
+
+	// Find ST's prompt manager list separator
+	const separator = document.querySelector('.completion_prompt_manager_list_separator');
+	if (!separator) return;
+
+	// Remove any existing CCPM template indicator
+	const existing = document.getElementById('ccpm-template-indicator');
+	if (existing) existing.remove();
+
+	// Get current effective lock
+	promptTemplateManager.getEffectiveLock().then(effectiveLock => {
+		if (!effectiveLock || !effectiveLock.templateId) return;
+
+		const template = promptTemplateManager.getTemplate(effectiveLock.templateId);
+		if (!template) return;
+
+		// Create template indicator element
+		const indicator = document.createElement('div');
+		indicator.id = 'ccpm-template-indicator';
+		indicator.className = 'ccpm-template-indicator';
+		indicator.innerHTML = `
+			<small class="text_muted">
+				<span class="fa-solid fa-file-lines"></span>
+				Template: <strong>${escapeHtml(template.name)}</strong>
+				<span class="text_muted">(${escapeHtml(effectiveLock.source)})</span>
+			</small>
+		`;
+
+		// Insert after the <hr> in the separator
+		const hr = separator.querySelector('hr');
+		if (hr) {
+			hr.insertAdjacentElement('afterend', indicator);
+		} else {
+			separator.appendChild(indicator);
+		}
+	}).catch(() => {
+		// Silent fail if lock retrieval fails
+	});
+}
 
 // ===== LOCKING SYSTEM CLASSES =====
 
@@ -80,6 +130,7 @@ class ChatContext {
     _buildGroupContext() {
         const groupId = selected_group;
         const group = groups?.find(x => x.id === groupId);
+        const modelName = this._getCurrentModelName();
 
         return {
             type: CHAT_TYPES.GROUP,
@@ -89,6 +140,7 @@ class ChatContext {
             chatId: group?.chat_id || null,
             chatName: group?.name || null,
             characterName: group?.name || null,
+            modelName,
             primaryId: groupId,
             secondaryId: group?.chat_id
         };
@@ -96,7 +148,12 @@ class ChatContext {
 
     _buildSingleContext() {
         const characterName = this._getCharacterNameForSettings();
+        const modelName = this._getCurrentModelName();
         const chatId = this._getCurrentChatId();
+
+        // Determine primaryId based on lockingMode
+        const lockingMode = extension_settings.ccPromptManager?.lockingMode || LOCKING_MODES.MODEL;
+        const primaryId = lockingMode === LOCKING_MODES.MODEL ? modelName : characterName;
 
         return {
             type: CHAT_TYPES.SINGLE,
@@ -106,7 +163,8 @@ class ChatContext {
             chatId,
             chatName: chatId,
             characterName,
-            primaryId: characterName,
+            modelName,
+            primaryId,
             secondaryId: chatId
         };
     }
@@ -147,6 +205,10 @@ class ChatContext {
         } catch (error) {
             return null;
         }
+    }
+
+    _getCurrentModelName() {
+        return oai_settings.model || null;
     }
 }
 
@@ -214,6 +276,54 @@ class TemplateStorageAdapter {
 
         if (extensionSettings.templateLocks?.character?.[chIdKey]) {
             delete extensionSettings.templateLocks.character[chIdKey];
+            this.saveExtensionSettings();
+            return true;
+        }
+
+        return false;
+    }
+
+    // Model template locks
+    getModelTemplateLock(modelKey) {
+        if (modelKey === undefined || modelKey === null) {
+            return null;
+        }
+
+        const extensionSettings = this.getExtensionSettings();
+        const saveKey = String(modelKey);
+        return extensionSettings.templateLocks?.model?.[saveKey] || null;
+    }
+
+    setModelTemplateLock(modelKey, templateId) {
+        if (modelKey === undefined || modelKey === null) {
+            return false;
+        }
+
+        const extensionSettings = this.getExtensionSettings();
+
+        if (!extensionSettings.templateLocks) {
+            extensionSettings.templateLocks = {};
+        }
+        if (!extensionSettings.templateLocks.model) {
+            extensionSettings.templateLocks.model = {};
+        }
+
+        const saveKey = String(modelKey);
+        extensionSettings.templateLocks.model[saveKey] = templateId;
+        this.saveExtensionSettings();
+        return true;
+    }
+
+    deleteModelTemplateLock(modelKey) {
+        if (modelKey === undefined || modelKey === null) {
+            return false;
+        }
+
+        const extensionSettings = this.getExtensionSettings();
+        const saveKey = String(modelKey);
+
+        if (extensionSettings.templateLocks?.model?.[saveKey]) {
+            delete extensionSettings.templateLocks.model[saveKey];
             this.saveExtensionSettings();
             return true;
         }
@@ -400,21 +510,26 @@ class TemplateLockResolver {
 
     _resolveGroupLocks(context, locks) {
         const prefs = this.extensionSettings;
-        const { group, chat, character } = locks;
+        const { group, chat, character, model } = locks;
+
+        // Determine primary lock based on lockingMode
+        const lockingMode = prefs.lockingMode || LOCKING_MODES.MODEL;
+        const primaryLock = lockingMode === LOCKING_MODES.MODEL ? model : character;
+        const primarySource = lockingMode === LOCKING_MODES.MODEL ? 'model' : 'character';
 
         // Use user-defined priorities for group chats
-        if (prefs.preferIndividualCharacterInGroup && character) {
-            return { templateId: character, source: SETTING_SOURCES.CHARACTER };
+        if (prefs.preferIndividualCharacterInGroup && primaryLock) {
+            return { templateId: primaryLock, source: primarySource };
         }
 
         if (prefs.preferGroupOverChat) {
             if (group) return { templateId: group, source: SETTING_SOURCES.GROUP };
             if (chat) return { templateId: chat, source: `${SETTING_SOURCES.GROUP_CHAT} (fallback)` };
-            if (character) return { templateId: character, source: `${SETTING_SOURCES.CHARACTER} (fallback)` };
+            if (primaryLock) return { templateId: primaryLock, source: `${primarySource} (fallback)` };
         } else {
             if (chat) return { templateId: chat, source: SETTING_SOURCES.GROUP_CHAT };
             if (group) return { templateId: group, source: `${SETTING_SOURCES.GROUP} (fallback)` };
-            if (character) return { templateId: character, source: `${SETTING_SOURCES.CHARACTER} (fallback)` };
+            if (primaryLock) return { templateId: primaryLock, source: `${primarySource} (fallback)` };
         }
 
         return { templateId: null, source: 'none' };
@@ -422,15 +537,20 @@ class TemplateLockResolver {
 
     _resolveSingleLocks(context, locks) {
         const prefs = this.extensionSettings;
-        const { character, chat } = locks;
+        const { character, model, chat } = locks;
+
+        // Determine primary lock based on lockingMode
+        const lockingMode = prefs.lockingMode || LOCKING_MODES.MODEL;
+        const primaryLock = lockingMode === LOCKING_MODES.MODEL ? model : character;
+        const primarySource = lockingMode === LOCKING_MODES.MODEL ? 'model' : 'character';
 
         // Use user-defined priority for single chats
         if (prefs.preferCharacterOverChat) {
-            if (character) return { templateId: character, source: SETTING_SOURCES.CHARACTER };
+            if (primaryLock) return { templateId: primaryLock, source: primarySource };
             if (chat) return { templateId: chat, source: `${SETTING_SOURCES.CHAT} (fallback)` };
         } else {
             if (chat) return { templateId: chat, source: SETTING_SOURCES.CHAT };
-            if (character) return { templateId: character, source: `${SETTING_SOURCES.CHARACTER} (fallback)` };
+            if (primaryLock) return { templateId: primaryLock, source: `${primarySource} (fallback)` };
         }
 
         return { templateId: null, source: 'none' };
@@ -451,6 +571,7 @@ class TemplateLockManager {
     _getEmptyLocks() {
         return {
             character: null,
+            model: null,
             chat: null,
             group: null
         };
@@ -481,15 +602,27 @@ class TemplateLockManager {
             const characterKey = chId !== -1 ? chId : context.characterName;
             this.currentLocks.character = this.storage.getCharacterTemplateLock(characterKey);
         }
+
+        // Load model lock
+        if (context.modelName) {
+            this.currentLocks.model = this.storage.getModelTemplateLock(context.modelName);
+        }
     }
 
     _loadSingleLocks(context) {
+        // Load character lock
         if (context.characterName) {
             const chId = characters?.findIndex(x => x.name === context.characterName);
             const characterKey = chId !== -1 ? chId : context.characterName;
             this.currentLocks.character = this.storage.getCharacterTemplateLock(characterKey);
         }
 
+        // Load model lock
+        if (context.modelName) {
+            this.currentLocks.model = this.storage.getModelTemplateLock(context.modelName);
+        }
+
+        // Load chat lock
         if (context.chatId) {
             this.currentLocks.chat = this.storage.getChatTemplateLock();
         }
@@ -514,6 +647,12 @@ class TemplateLockManager {
                     const characterKey = chId !== -1 ? chId : context.characterName;
                     success = this.storage.setCharacterTemplateLock(characterKey, templateId);
                     if (success) this.currentLocks.character = templateId;
+                }
+                break;
+            case 'model':
+                if (context.modelName) {
+                    success = this.storage.setModelTemplateLock(context.modelName, templateId);
+                    if (success) this.currentLocks.model = templateId;
                 }
                 break;
             case 'chat':
@@ -546,6 +685,12 @@ class TemplateLockManager {
                     const characterKey = chId !== -1 ? chId : context.characterName;
                     success = this.storage.deleteCharacterTemplateLock(characterKey);
                     if (success) this.currentLocks.character = null;
+                }
+                break;
+            case 'model':
+                if (context.modelName) {
+                    success = this.storage.deleteModelTemplateLock(context.modelName);
+                    if (success) this.currentLocks.model = null;
                 }
                 break;
             case 'chat':
@@ -670,10 +815,11 @@ class PromptTemplateManager {
 		const defaultSettings = {
 			templates: {},
 			templateLocks: {},
+			lockingMode: LOCKING_MODES.MODEL,  // 'character' or 'model'
 			autoApplyMode: AUTO_APPLY_MODES.ASK,  // 'never', 'ask', or 'always'
-			// Priority preferences for single chat (character vs chat)
+			// Priority preferences for single chat (character/model vs chat)
 			preferCharacterOverChat: true,
-			// Priority preferences for group chat (group vs chat vs character)
+			// Priority preferences for group chat (group vs chat vs character/model)
 			preferGroupOverChat: true,
 			preferIndividualCharacterInGroup: false,
 			version: '1.0.0'
@@ -685,6 +831,9 @@ class PromptTemplateManager {
 		}
 
 		// Ensure all settings exist
+		if (extension_settings.ccPromptManager.lockingMode === undefined) {
+			extension_settings.ccPromptManager.lockingMode = LOCKING_MODES.MODEL;
+		}
 		if (extension_settings.ccPromptManager.preferCharacterOverChat === undefined) {
 			extension_settings.ccPromptManager.preferCharacterOverChat = true;
 		}
@@ -944,6 +1093,9 @@ class PromptTemplateManager {
 			console.log('CCPM DEBUG: Calling promptManager.render()');
 			await promptManager.render();
 
+			// Inject template name into ST's prompt manager UI after render
+			setTimeout(() => injectTemplateNameIntoPromptManager(), 100);
+
 			toastr.success(`Template "${tmpl.name}" applied`);
 			console.log('CCPM: Template applied successfully:', tmpl.name);
 			return true;
@@ -1037,6 +1189,13 @@ class PromptTemplateManager {
 			});
 		}
 
+		// Listen for OAI preset changes (model changes) - used in model mode
+		if (event_types.OAI_PRESET_CHANGED_AFTER) {
+			eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, () => {
+				this.handleOaiPresetChange();
+			});
+		}
+
 		// Listen for character changes to potentially auto-apply templates
 		eventSource.on(event_types.CHAT_CHANGED, () => {
 			this.handleChatChange();
@@ -1092,6 +1251,17 @@ class PromptTemplateManager {
 			eventSource.on(event_types.GENERATION_ENDED, () => {
 				this.handleGenerationEnded();
 			});
+		}
+
+		// Inject template name into ST's prompt manager UI whenever it updates
+		const injectTemplateNameDebounced = debounce(injectTemplateNameIntoPromptManager, 500);
+		eventSource.on(event_types.CHAT_CHANGED, injectTemplateNameDebounced);
+		eventSource.on(event_types.SETTINGS_UPDATED, injectTemplateNameDebounced);
+		if (event_types.CHATCOMPLETION_MODEL_CHANGED) {
+			eventSource.on(event_types.CHATCOMPLETION_MODEL_CHANGED, injectTemplateNameDebounced);
+		}
+		if (event_types.OAI_PRESET_CHANGED_AFTER) {
+			eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, injectTemplateNameDebounced);
 		}
 	}
 
@@ -1151,6 +1321,26 @@ class PromptTemplateManager {
 				toastr.info(`Auto-reapplied template: ${template.name}`);
 			}
 		}
+	}
+
+	/**
+	 * Handle OAI preset change event (model changes) - used in model mode
+	 */
+	async handleOaiPresetChange() {
+		const lockingMode = extension_settings.ccPromptManager?.lockingMode || LOCKING_MODES.MODEL;
+
+		// Only handle this event in model mode
+		if (lockingMode !== LOCKING_MODES.MODEL) {
+			return;
+		}
+
+		console.log('CCPM: OAI preset changed, invalidating context and checking for model locks');
+
+		// Invalidate context cache to pick up new model name
+		this.lockManager.chatContext.invalidate();
+
+		// Reuse the existing preset change logic
+		await this.handlePresetChange();
 	}
 
 	/**
@@ -1434,6 +1624,10 @@ class PromptTemplateManager {
 		eventSource.off(event_types.EXTENSION_SETTINGS_LOADED, this.handleExtensionSettingsLoaded);
 		eventSource.off(event_types.APP_READY, this.handleAppReady);
 
+		if (event_types.OAI_PRESET_CHANGED_AFTER) {
+			eventSource.off(event_types.OAI_PRESET_CHANGED_AFTER, this.handleOaiPresetChange);
+		}
+
 		// Additional event handlers from SillyTavern-CharacterLocks
 		eventSource.off(event_types.GROUP_CHAT_CREATED, this.handleGroupChatCreated);
 		eventSource.off(event_types.GROUP_MEMBER_DRAFTED, this.handleGroupMemberDrafted);
@@ -1458,6 +1652,10 @@ class PromptTemplateManager {
 
 // Example: create a global instance (optional)
 export const promptTemplateManager = new PromptTemplateManager();
+
+// Expose for debugging
+window.ccpmTemplateManager = promptTemplateManager;
+window.ccpmInjectTemplateName = injectTemplateNameIntoPromptManager;
 // --- CCPM Prompt Template Manager UI Injection ---
 function injectPromptTemplateManagerButton() {
 	// Wait for DOM ready and #extensionsMenuButton to exist
@@ -1557,6 +1755,7 @@ async function renderPromptTemplateList() {
 
 		// Check if this template is locked to any target
 		const isLockedToCharacter = currentLocks.character === t.id;
+		const isLockedToModel = currentLocks.model === t.id;
 		const isLockedToChat = currentLocks.chat === t.id;
 		const isLockedToGroup = currentLocks.group === t.id;
 		const isEffectiveTemplate = effectiveLock.templateId === t.id;
@@ -1564,8 +1763,9 @@ async function renderPromptTemplateList() {
 		let lockStatus = '';
 		if (isEffectiveTemplate) {
 			lockStatus = `<span class="fontsize80p toggleEnabled" title="Currently active from ${effectiveLock.source}">🔒 Active (${effectiveLock.source})</span>`;
-		} else if (isLockedToCharacter || isLockedToChat || isLockedToGroup) {
+		} else if (isLockedToModel || isLockedToCharacter || isLockedToChat || isLockedToGroup) {
 			const lockTypes = [];
+			if (isLockedToModel) lockTypes.push('model');
 			if (isLockedToCharacter) lockTypes.push('character');
 			if (isLockedToChat) lockTypes.push('chat');
 			if (isLockedToGroup) lockTypes.push('group');
@@ -1702,9 +1902,17 @@ window.ccpmShowLockMenu = async function(templateId) {
 	const currentLocks = await promptTemplateManager.getCurrentLocks();
 	const context = promptTemplateManager.lockManager.chatContext.getCurrent();
 
+	// Determine locking mode and available targets
+	const lockingMode = extension_settings.ccPromptManager?.lockingMode || LOCKING_MODES.MODEL;
+	const primaryTarget = lockingMode === LOCKING_MODES.MODEL ? 'model' : 'character';
+	const primaryLabel = lockingMode === LOCKING_MODES.MODEL ? 'Model' : 'Character';
+
 	// Determine available lock targets based on context
 	const availableTargets = [];
-	if (context.characterName) {
+	// Add primary target (model or character) if available
+	if (lockingMode === LOCKING_MODES.MODEL && context.modelName) {
+		availableTargets.push('model');
+	} else if (lockingMode === LOCKING_MODES.CHARACTER && context.characterName) {
 		availableTargets.push('character');
 	}
 	if (context.chatId || context.groupId) {
@@ -1723,6 +1931,18 @@ window.ccpmShowLockMenu = async function(templateId) {
 	content.innerHTML = `
 		<div class="flex-container flexFlowColumn flexGap10">
 			<h4>Lock Template: ${escapeHtml(template.name)}</h4>
+
+			<div class="completion_prompt_manager_popup_entry_form_control">
+				<label for="ccpm-locking-mode">Locking Mode:</label>
+				<select id="ccpm-locking-mode" class="text_pole" onchange="window.ccpmSetLockingMode(this.value)">
+					<option value="${LOCKING_MODES.MODEL}" ${lockingMode === LOCKING_MODES.MODEL ? 'selected' : ''}>Model (recommended)</option>
+					<option value="${LOCKING_MODES.CHARACTER}" ${lockingMode === LOCKING_MODES.CHARACTER ? 'selected' : ''}>Character</option>
+				</select>
+				<small class="text_muted">Model mode locks templates to API models (e.g., GPT-4, Claude). Character mode locks to character names.</small>
+			</div>
+
+			<hr>
+
 			<p>Choose where to lock this template:</p>
 
 			<div class="flex-container flexFlowColumn flexGap10">
@@ -1738,7 +1958,7 @@ window.ccpmShowLockMenu = async function(templateId) {
 								${isCurrentlyLocked ? 'checked' : ''}
 								onchange="if(this.checked) { ccpmLockToTarget('${templateId}', '${target}'); } else { ccpmClearLock('${target}'); }">
 							<span>
-								<strong>${target.charAt(0).toUpperCase() + target.slice(1)}</strong>
+								<strong>${target === 'model' || target === 'character' ? (target === 'model' ? 'Model' : 'Character') : target.charAt(0).toUpperCase() + target.slice(1)}</strong>
 								${contextName ? ` - <small class="text_muted">${escapeHtml(contextName)}</small>` : ''}
 								${hasOtherLock ? '<br><small class="text_danger">⚠️ Another template is locked</small>' : ''}
 							</span>
@@ -1781,14 +2001,14 @@ window.ccpmShowLockMenu = async function(templateId) {
 						</label>
 						<label class="checkbox_label">
 							<input type="checkbox" id="ccpm-pref-individual-char" ${preferIndividualCharacterInGroup ? 'checked' : ''} onchange="window.ccpmSetPriority('preferIndividualCharacterInGroup', this.checked)">
-							<span>Prefer character settings over group or chat</span>
+							<span>Prefer ${primaryLabel.toLowerCase()} settings over group or chat</span>
 						</label>
 					</div>
 				` : `
 					<div class="marginTop10">
 						<label class="checkbox_label">
 							<input type="checkbox" id="ccpm-pref-char-over-chat" ${preferCharacterOverChat ? 'checked' : ''} onchange="window.ccpmSetPriority('preferCharacterOverChat', this.checked)">
-							<span>Prefer character settings over chat</span>
+							<span>Prefer ${primaryLabel.toLowerCase()} settings over chat</span>
 						</label>
 					</div>
 				`}
@@ -1809,6 +2029,8 @@ function getContextName(context, target) {
 	switch (target) {
 		case 'character':
 			return context.characterName || 'Current Character';
+		case 'model':
+			return context.modelName || 'Current Model';
 		case 'chat':
 			if (context.isGroupChat) {
 				return context.groupName ? `${context.groupName} Chat` : 'Group Chat';
@@ -1850,6 +2072,17 @@ window.ccpmSetPriority = function(preference, value) {
 	extension_settings.ccPromptManager[preference] = value;
 	saveSettingsDebounced();
 	console.log('CCPM: Priority preference set:', preference, '=', value);
+};
+
+window.ccpmSetLockingMode = function(mode) {
+	extension_settings.ccPromptManager.lockingMode = mode;
+	saveSettingsDebounced();
+	console.log('CCPM: Locking mode set to:', mode);
+	// Invalidate context cache to force reload with new mode
+	if (promptTemplateManager?.lockManager?.chatContext) {
+		promptTemplateManager.lockManager.chatContext.invalidate();
+	}
+	toastr.success(`Locking mode changed to ${mode}. Template list will update on next interaction.`);
 };
 
 window.ccpmViewPrompts = async function(templateId) {

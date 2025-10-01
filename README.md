@@ -1,6 +1,6 @@
 # 📂 CCPromptManager (CCPM Extension for SillyTavern)
 
-Advanced chat completion prompt template management extension for SillyTavern. Create, save, and lock prompt configurations per character, chat, or group with automatic reapplication on preset or character changes.
+Advanced chat completion prompt template management extension for SillyTavern. Create, save, and lock prompt configurations per model, character, chat, or group with automatic reapplication on preset or character changes.
 
 📋 **[View Changelog](CHANGELOG.md)** for detailed version history and updates.
 
@@ -19,9 +19,32 @@ The extension is located in the Extensions menu (the magic wand 🪄 to the left
 - **Reorder prompts** via drag-and-drop handles
 - **Import/Export** templates for backup or sharing
 
+### 🎯 Locking Modes
+
+**NEW**: Choose how templates are locked and applied:
+
+- **Model Mode (Recommended)**: Lock templates to API models (e.g., GPT-4, Claude)
+  - Templates automatically switch when you change models/presets
+  - Perfect for model-specific prompt engineering
+  - Ideal for multi-model workflows
+
+- **Character Mode (Legacy)**: Lock templates to character names
+  - Templates apply based on which character you're chatting with
+  - Original CCPM behavior
+
+**⚠️ Important**: New installations default to Model Mode. Existing users remain in Character Mode for compatibility.
+
 ### 🔒 Hierarchical Locking System
+
 Lock templates to specific contexts with intelligent priority resolution:
 
+**Model Mode**:
+- **Model Lock**: Apply template when using a specific API model
+- **Chat Lock**: Apply template only to the current chat
+- **Group Lock**: Apply template to all chats in a group
+- **Group Chat Lock**: Apply template to specific group chat sessions
+
+**Character Mode**:
 - **Character Lock**: Apply template to all chats with a specific character
 - **Chat Lock**: Apply template only to the current chat
 - **Group Lock**: Apply template to all chats in a group
@@ -59,11 +82,13 @@ Auto-apply triggers on:
 
 1. Open CCPromptManager from Extensions menu
 2. Click the **🔒 Lock** icon on any template
-3. Check the contexts where you want this template active:
-   - ✅ **Character**: Locks to current character (all chats)
-   - ✅ **Chat**: Locks to current chat only
-   - ✅ **Group**: Locks to current group (all chats)
-4. Set your **auto-apply preference**:
+3. **Choose your locking mode** (at the top of the lock menu):
+   - **Model Mode**: Lock based on API model (recommended for most users)
+   - **Character Mode**: Lock based on character names (legacy behavior)
+4. Check the contexts where you want this template active:
+   - In **Model Mode**: ✅ **Model**, **Chat**, **Group**, or **Group Chat**
+   - In **Character Mode**: ✅ **Character**, **Chat**, **Group**, or **Group Chat**
+5. Set your **auto-apply preference**:
    - **Never**: Won't reapply automatically
    - **Ask**: Prompts before reapplying (recommended)
    - **Always**: Auto-reapplies silently
