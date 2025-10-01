@@ -69,11 +69,21 @@
 
 /* CCPM template indicator in ST's prompt manager */
 .ccpm-template-indicator {
-    padding: 5px 10px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
     text-align: center;
     font-size: 0.9em;
+    background: var(--SmartThemeBlurTintColor);
+    border-radius: 5px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    width: 100%;
+    box-sizing: border-box;
 }
 
-.ccpm-template-indicator .fa-file-lines {
-    margin-right: 3px;
+.ccpm-template-indicator .fa-solid {
+    margin-right: 5px;
+}
+
+.ccpm-template-indicator div {
+    line-height: 1.6;
 }

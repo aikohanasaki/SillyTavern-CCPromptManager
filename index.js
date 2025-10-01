@@ -9,6 +9,9 @@ import { escapeHtml, debounce } from '../../../utils.js';
 const MODULE_NAME = 'CCPM';
 const CACHE_TTL = 1000;
 
+// Track the last manually applied template (for display purposes)
+let lastAppliedTemplateId = null;
+
 const CHAT_TYPES = {
     SINGLE: 'single',
     GROUP: 'group'
@@ -41,9 +44,9 @@ const getCurrentChatMetadata = () => chat_metadata;
 function injectTemplateNameIntoPromptManager() {
 	if (!promptTemplateManager) return;
 
-	// Find ST's prompt manager list separator
-	const separator = document.querySelector('.completion_prompt_manager_list_separator');
-	if (!separator) return;
+	// Find ST's prompt manager list
+	const promptList = document.getElementById('completion_prompt_manager_list');
+	if (!promptList) return;
 
 	// Remove any existing CCPM template indicator
 	const existing = document.getElementById('ccpm-template-indicator');
@@ -51,30 +54,51 @@ function injectTemplateNameIntoPromptManager() {
 
 	// Get current effective lock
 	promptTemplateManager.getEffectiveLock().then(effectiveLock => {
-		if (!effectiveLock || !effectiveLock.templateId) return;
+		let statusHtml = '';
 
-		const template = promptTemplateManager.getTemplate(effectiveLock.templateId);
-		if (!template) return;
+		// Check if manually applied template differs from locked template
+		const hasLock = effectiveLock && effectiveLock.templateId;
+		const hasManualOverride = lastAppliedTemplateId && lastAppliedTemplateId !== effectiveLock?.templateId;
+
+		if (hasManualOverride) {
+			// Case 1: Manual override - show both locked and applied
+			const lockedTemplate = promptTemplateManager.getTemplate(effectiveLock.templateId);
+			const appliedTemplate = promptTemplateManager.getTemplate(lastAppliedTemplateId);
+
+			if (!appliedTemplate) return;
+
+			statusHtml = `
+				<div><span class="fa-solid fa-lock"></span> Locked: <strong>${escapeHtml(lockedTemplate.name)}</strong> <span class="text_muted">(${escapeHtml(effectiveLock.source)})</span></div>
+				<div><span class="fa-solid fa-file-lines"></span> Applied: <strong>${escapeHtml(appliedTemplate.name)}</strong> <span class="text_muted">(manual override)</span></div>
+			`;
+		} else if (hasLock) {
+			// Case 2: Template is locked and active (no override)
+			const template = promptTemplateManager.getTemplate(effectiveLock.templateId);
+			if (!template) return;
+
+			statusHtml = `<span class="fa-solid fa-lock"></span> Prompt Template: <strong>${escapeHtml(template.name)}</strong> <span class="text_muted">(${escapeHtml(effectiveLock.source)})</span>`;
+		} else if (lastAppliedTemplateId) {
+			// Case 3: Template was manually applied (no lock exists)
+			const template = promptTemplateManager.getTemplate(lastAppliedTemplateId);
+			if (template) {
+				statusHtml = `<span class="fa-solid fa-file-lines"></span> Prompt Template: <strong>${escapeHtml(template.name)}</strong> <span class="text_muted">(applied)</span>`;
+			} else {
+				// Template was deleted after being applied
+				statusHtml = '<span class="fa-solid fa-circle-info"></span> No prompt template applied, using preset default';
+			}
+		} else {
+			// Case 4: No lock, no manual application
+			statusHtml = '<span class="fa-solid fa-circle-info"></span> No prompt template applied, using preset default';
+		}
 
 		// Create template indicator element
 		const indicator = document.createElement('div');
 		indicator.id = 'ccpm-template-indicator';
 		indicator.className = 'ccpm-template-indicator';
-		indicator.innerHTML = `
-			<small class="text_muted">
-				<span class="fa-solid fa-file-lines"></span>
-				Template: <strong>${escapeHtml(template.name)}</strong>
-				<span class="text_muted">(${escapeHtml(effectiveLock.source)})</span>
-			</small>
-		`;
+		indicator.innerHTML = `<small class="text_muted">${statusHtml}</small>`;
 
-		// Insert after the <hr> in the separator
-		const hr = separator.querySelector('hr');
-		if (hr) {
-			hr.insertAdjacentElement('afterend', indicator);
-		} else {
-			separator.appendChild(indicator);
-		}
+		// Insert before the prompt list
+		promptList.insertAdjacentElement('beforebegin', indicator);
 	}).catch(() => {
 		// Silent fail if lock retrieval fails
 	});
@@ -1086,6 +1110,10 @@ class PromptTemplateManager {
 			}
 
 			// Save settings and trigger update using PromptManager's method
+			// Track this as the last applied template BEFORE render
+			// (so event listeners can pick it up)
+			lastAppliedTemplateId = templateId;
+
 			// Important: Save first, then render (matches ST's pattern)
 			console.log('CCPM DEBUG: Calling promptManager.saveServiceSettings()');
 			await promptManager.saveServiceSettings();
@@ -2050,6 +2078,8 @@ window.ccpmLockToTarget = async function(templateId, target) {
 		// The lock menu popup will close itself via its cancelButton
 		// Just refresh the template list in the main popup
 		await renderPromptTemplateList();
+		// Update the template name display in ST's prompt manager
+		setTimeout(() => injectTemplateNameIntoPromptManager(), 100);
 	}
 };
 
@@ -2059,6 +2089,8 @@ window.ccpmClearLock = async function(target) {
 		// The lock menu popup will close itself via its cancelButton
 		// Just refresh the template list in the main popup
 		await renderPromptTemplateList();
+		// Update the template name display in ST's prompt manager
+		setTimeout(() => injectTemplateNameIntoPromptManager(), 100);
 	}
 };
 
