@@ -42,10 +42,10 @@ All notable changes to CCPromptManager will be documented in this file.
   - Import/Export functionality for templates
 
 - **Hierarchical Lock System**
-  - Lock templates to character, chat, group, or group chat contexts
+  - Lock templates to character/model, chat, group, or group chat contexts
   - User-configurable priority preferences (similar to STCL)
-  - Single chat: Prefer character over chat (or vice versa)
-  - Group chat: Prefer group over chat, or individual character over all
+  - Single chat: Prefer primary (model/character) over chat (or vice versa)
+  - Group chat: Prefer group over chat, or primary over all
   - Visual indicators for active locks
   - Lock status display in template list
 

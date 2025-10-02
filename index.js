@@ -9,9 +9,6 @@ import { escapeHtml, debounce } from '../../../utils.js';
 const MODULE_NAME = 'CCPM';
 const CACHE_TTL = 1000;
 
-// Track the last manually applied template (for display purposes)
-let lastAppliedTemplateId = null;
-
 const CHAT_TYPES = {
     SINGLE: 'single',
     GROUP: 'group'
@@ -35,13 +32,1252 @@ const LOCKING_MODES = {
     MODEL: 'model'
 };
 
+// ============================================================================
+// TEMPLATE OPERATIONS MODULE (Pure Functions)
+// ============================================================================
+
+/**
+ * Pure functions for template data manipulation
+ * No side effects, no external dependencies beyond oai_settings reads
+ */
+const TemplateOps = {
+	/**
+	 * Generate unique template ID
+	 * @returns {string}
+	 */
+	generateId() {
+		return 'tmpl_' + Math.random().toString(36).substr(2, 9);
+	},
+
+	/**
+	 * Create template object from current ST prompts
+	 * @param {Object} params
+	 * @param {string} params.name - Template name
+	 * @param {string} params.description - Template description
+	 * @param {Array<string>} [params.includePrompts] - Specific prompt identifiers to include (null = all)
+	 * @param {string} [params.id] - Optional ID (generates if not provided)
+	 * @returns {Object} Template object
+	 */
+	createFromCurrent({ name, description, includePrompts = null, id = null }) {
+		const availablePrompts = oai_settings.prompts || [];
+
+		// Convert array to object keyed by identifier
+		const promptsMap = Array.isArray(availablePrompts)
+			? availablePrompts.reduce((acc, p) => {
+				if (p.identifier) acc[p.identifier] = p;
+				return acc;
+			}, {})
+			: availablePrompts;
+
+		// Select prompts to include
+		const selectedPrompts = {};
+		const identifiersToInclude = includePrompts || Object.keys(promptsMap);
+
+		for (const identifier of identifiersToInclude) {
+			if (promptsMap[identifier]) {
+				selectedPrompts[identifier] = { ...promptsMap[identifier] };
+			}
+		}
+
+		// Get prompt order from PromptManager
+		let promptOrder = [];
+		let promptOrderCharacterId = null;
+
+		if (promptManager?.activeCharacter) {
+			promptOrderCharacterId = promptManager.activeCharacter.id;
+			promptOrder = promptManager.getPromptOrderForCharacter(promptManager.activeCharacter);
+		}
+
+		// Get character name from context
+		const context = getContext();
+		const characterName = context.name2 || name2;
+
+		// Create template object
+		return {
+			id: id || TemplateOps.generateId(),
+			name,
+			description,
+			prompts: selectedPrompts,
+			promptOrder: promptOrder || [],
+			promptOrderCharacterId,
+			characterName,
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString()
+		};
+	},
+
+	/**
+	 * Validate template structure
+	 * @param {Object} template
+	 * @returns {boolean}
+	 */
+	validate(template) {
+		if (!template || typeof template !== 'object') return false;
+		if (!template.id || typeof template.id !== 'string') return false;
+		if (!template.name || typeof template.name !== 'string') return false;
+		if (!template.prompts || typeof template.prompts !== 'object') return false;
+		return true;
+	},
+
+	/**
+	 * Update template fields (pure - returns new object)
+	 * @param {Object} template - Original template
+	 * @param {Object} updates - Fields to update
+	 * @returns {Object} New template object
+	 */
+	update(template, updates) {
+		return {
+			...template,
+			...updates,
+			id: template.id, // Never update ID
+			createdAt: template.createdAt, // Never update creation time
+			updatedAt: new Date().toISOString()
+		};
+	},
+
+	/**
+	 * Serialize templates for export
+	 * @param {Object|Map} templates - Templates to export (Map or Object)
+	 * @returns {string} JSON string
+	 */
+	serialize(templates) {
+		const templatesObj = templates instanceof Map
+			? Object.fromEntries(templates)
+			: templates;
+		return JSON.stringify(templatesObj, null, 2);
+	},
+
+	/**
+	 * Deserialize templates from import
+	 * @param {string} json - JSON string
+	 * @returns {Object} Templates object
+	 */
+	deserialize(json) {
+		try {
+			const parsed = JSON.parse(json);
+			// Validate all templates
+			const valid = Object.values(parsed).every(t => TemplateOps.validate(t));
+			if (!valid) throw new Error('Invalid template format');
+			return parsed;
+		} catch (error) {
+			throw new Error('Failed to parse template JSON: ' + error.message);
+		}
+	},
+
+	/**
+	 * Clone a template with new ID and name
+	 * @param {Object} template - Template to clone
+	 * @param {string} newName - New template name
+	 * @returns {Object} Cloned template
+	 */
+	clone(template, newName) {
+		return {
+			...template,
+			id: TemplateOps.generateId(),
+			name: newName,
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString()
+		};
+	}
+};
+
+// ============================================================================
+// STORAGE MODULE (Simple CRUD - No Logic)
+// ============================================================================
+
+/**
+ * Simple storage operations - just read/write to extension_settings and chat_metadata
+ * No business logic, no validation, no decisions
+ */
+const Storage = {
+	/**
+	 * Get extension settings object, creating if needed
+	 * @returns {Object}
+	 */
+	_getExtensionSettings() {
+		if (!extension_settings.ccPromptManager) {
+			extension_settings.ccPromptManager = {
+				templates: {},
+				templateLocks: {},
+				lockingMode: LOCKING_MODES.MODEL,
+				autoApplyMode: AUTO_APPLY_MODES.ASK,
+				preferPrimaryOverChat: true,
+				preferGroupOverChat: true,
+				preferIndividualCharacterInGroup: false,
+				version: '1.0.0'
+			};
+		}
+		return extension_settings.ccPromptManager;
+	},
+
+	// ===== TEMPLATES =====
+
+	/**
+	 * Get single template by ID
+	 * @param {string} id
+	 * @returns {Object|null}
+	 */
+	getTemplate(id) {
+		const settings = this._getExtensionSettings();
+		return settings.templates[id] || null;
+	},
+
+	/**
+	 * Get all templates as Map
+	 * @returns {Map<string, Object>}
+	 */
+	getAllTemplates() {
+		const settings = this._getExtensionSettings();
+		return new Map(Object.entries(settings.templates));
+	},
+
+	/**
+	 * Save template
+	 * @param {Object} template
+	 */
+	saveTemplate(template) {
+		const settings = this._getExtensionSettings();
+		settings.templates[template.id] = template;
+		saveSettingsDebounced();
+	},
+
+	/**
+	 * Delete template
+	 * @param {string} id
+	 * @returns {boolean} True if deleted
+	 */
+	deleteTemplate(id) {
+		const settings = this._getExtensionSettings();
+		if (settings.templates[id]) {
+			delete settings.templates[id];
+			saveSettingsDebounced();
+			return true;
+		}
+		return false;
+	},
+
+	// ===== LOCKS =====
+
+	/**
+	 * Get character lock
+	 * @param {string} characterKey - Character name or ID
+	 * @returns {string|null} Template ID
+	 */
+	getCharacterLock(characterKey) {
+		if (!characterKey) return null;
+		const settings = this._getExtensionSettings();
+		const key = String(characterKey);
+		return settings.templateLocks?.character?.[key] || null;
+	},
+
+	/**
+	 * Set character lock
+	 * @param {string} characterKey
+	 * @param {string} templateId
+	 */
+	setCharacterLock(characterKey, templateId) {
+		if (!characterKey) return;
+		const settings = this._getExtensionSettings();
+		if (!settings.templateLocks) settings.templateLocks = {};
+		if (!settings.templateLocks.character) settings.templateLocks.character = {};
+		settings.templateLocks.character[String(characterKey)] = templateId;
+		saveSettingsDebounced();
+	},
+
+	/**
+	 * Clear character lock
+	 * @param {string} characterKey
+	 * @returns {boolean} True if cleared
+	 */
+	clearCharacterLock(characterKey) {
+		if (!characterKey) return false;
+		const settings = this._getExtensionSettings();
+		const key = String(characterKey);
+		if (settings.templateLocks?.character?.[key]) {
+			delete settings.templateLocks.character[key];
+			saveSettingsDebounced();
+			return true;
+		}
+		return false;
+	},
+
+	/**
+	 * Get model lock
+	 * @param {string} modelKey - Model preset name
+	 * @returns {string|null} Template ID
+	 */
+	getModelLock(modelKey) {
+		if (!modelKey) return null;
+		const settings = this._getExtensionSettings();
+		const key = String(modelKey);
+		return settings.templateLocks?.model?.[key] || null;
+	},
+
+	/**
+	 * Set model lock
+	 * @param {string} modelKey
+	 * @param {string} templateId
+	 */
+	setModelLock(modelKey, templateId) {
+		if (!modelKey) return;
+		const settings = this._getExtensionSettings();
+		if (!settings.templateLocks) settings.templateLocks = {};
+		if (!settings.templateLocks.model) settings.templateLocks.model = {};
+		settings.templateLocks.model[String(modelKey)] = templateId;
+		saveSettingsDebounced();
+	},
+
+	/**
+	 * Clear model lock
+	 * @param {string} modelKey
+	 * @returns {boolean} True if cleared
+	 */
+	clearModelLock(modelKey) {
+		if (!modelKey) return false;
+		const settings = this._getExtensionSettings();
+		const key = String(modelKey);
+		if (settings.templateLocks?.model?.[key]) {
+			delete settings.templateLocks.model[key];
+			saveSettingsDebounced();
+			return true;
+		}
+		return false;
+	},
+
+	/**
+	 * Get chat lock from chat_metadata
+	 * @returns {string|null} Template ID
+	 */
+	getChatLock() {
+		return chat_metadata?.ccpm_template_lock || null;
+	},
+
+	/**
+	 * Set chat lock in chat_metadata
+	 * @param {string} templateId
+	 */
+	setChatLock(templateId) {
+		chat_metadata.ccpm_template_lock = templateId;
+		saveMetadataDebounced();
+	},
+
+	/**
+	 * Clear chat lock
+	 * @returns {boolean} True if cleared
+	 */
+	clearChatLock() {
+		if (chat_metadata?.ccpm_template_lock) {
+			delete chat_metadata.ccpm_template_lock;
+			saveMetadataDebounced();
+			return true;
+		}
+		return false;
+	},
+
+	/**
+	 * Get group lock from group object
+	 * @param {string} groupId
+	 * @returns {string|null} Template ID
+	 */
+	getGroupLock(groupId) {
+		if (!groupId) return null;
+		const group = groups?.find(g => g.id === groupId);
+		return group?.ccpm_template_lock || null;
+	},
+
+	/**
+	 * Set group lock on group object
+	 * @param {string} groupId
+	 * @param {string} templateId
+	 */
+	setGroupLock(groupId, templateId) {
+		if (!groupId) return;
+		const group = groups?.find(g => g.id === groupId);
+		if (group) {
+			group.ccpm_template_lock = templateId;
+			editGroup(groupId, false); // Save group without refreshing UI
+		}
+	},
+
+	/**
+	 * Clear group lock
+	 * @param {string} groupId
+	 * @returns {boolean} True if cleared
+	 */
+	clearGroupLock(groupId) {
+		if (!groupId) return false;
+		const group = groups?.find(g => g.id === groupId);
+		if (group?.ccpm_template_lock) {
+			delete group.ccpm_template_lock;
+			editGroup(groupId, false);
+			return true;
+		}
+		return false;
+	},
+
+	// ===== PREFERENCES =====
+
+	/**
+	 * Get all preferences
+	 * @returns {Object}
+	 */
+	getPreferences() {
+		const settings = this._getExtensionSettings();
+		return {
+			lockingMode: settings.lockingMode || LOCKING_MODES.MODEL,
+			autoApplyMode: settings.autoApplyMode || AUTO_APPLY_MODES.ASK,
+			preferPrimaryOverChat: settings.preferPrimaryOverChat ?? true,
+			preferGroupOverChat: settings.preferGroupOverChat ?? true,
+			preferIndividualCharacterInGroup: settings.preferIndividualCharacterInGroup ?? false
+		};
+	},
+
+	/**
+	 * Update preference
+	 * @param {string} key
+	 * @param {any} value
+	 */
+	setPreference(key, value) {
+		const settings = this._getExtensionSettings();
+		settings[key] = value;
+		saveSettingsDebounced();
+	}
+};
+
+// ============================================================================
+// CONTEXT RESOLUTION (Pure Function)
+// ============================================================================
+
+/**
+ * Resolve current chat context
+ * Pure function - no caching (premature optimization removed)
+ * @returns {Object} Context object
+ */
+function resolveContext() {
+	const isGroupChat = !!selected_group;
+
+	if (isGroupChat) {
+		const groupId = selected_group;
+		const group = groups?.find(g => g.id === groupId);
+		const modelName = _getModelName();
+
+		return {
+			type: CHAT_TYPES.GROUP,
+			isGroupChat: true,
+			groupId,
+			groupName: group?.name || null,
+			chatId: group?.chat_id || null,
+			characterName: group?.name || null, // For display
+			modelName,
+			// Legacy fields for compatibility
+			primaryId: groupId,
+			secondaryId: group?.chat_id
+		};
+	}
+
+	// Single chat
+	const characterName = _getCharacterName();
+	const modelName = _getModelName();
+	const chatId = _getChatId();
+
+	return {
+		type: CHAT_TYPES.SINGLE,
+		isGroupChat: false,
+		groupId: null,
+		groupName: null,
+		chatId,
+		characterName,
+		modelName,
+		// Legacy fields for compatibility
+		primaryId: null, // Will be set by resolveLock based on lockingMode
+		secondaryId: chatId
+	};
+}
+
+/**
+ * Get current character name for settings/locks
+ * @private
+ */
+function _getCharacterName() {
+	let characterName = name2;
+
+	// Fallback to chat metadata
+	if (!characterName || characterName === systemUserName || characterName === neutralCharacterName) {
+		const metadata = chat_metadata;
+		characterName = metadata?.character_name;
+	}
+
+	if (!characterName) return null;
+
+	// Normalize
+	characterName = String(characterName).trim();
+	if (characterName.normalize) {
+		characterName = characterName.normalize('NFC');
+	}
+
+	return characterName;
+}
+
+/**
+ * Get current chat ID
+ * @private
+ */
+function _getChatId() {
+	try {
+		const context = getContext();
+		return context?.chatId || null;
+	} catch (error) {
+		return null;
+	}
+}
+
+/**
+ * Get current model name
+ * @private
+ */
+function _getModelName() {
+	try {
+		// Use ST's /model slash command
+		const modelName = window.executeSlashCommandsOnChatInput?.('/model') || null;
+		return modelName;
+	} catch (error) {
+		console.warn('CCPM: Error getting model name:', error);
+		return null;
+	}
+}
+
+// ============================================================================
+// LOCK RESOLUTION (Pure Function)
+// ============================================================================
+
+/**
+ * Resolve which lock should be applied based on context and preferences
+ * Pure function - just applies priority rules
+ * @param {Object} context - Context from resolveContext()
+ * @param {Object} preferences - Preferences from Storage.getPreferences()
+ * @returns {Object|null} {templateId, source} or null if no lock
+ */
+function resolveLock(context, preferences) {
+	const { lockingMode, preferPrimaryOverChat, preferGroupOverChat, preferIndividualCharacterInGroup } = preferences;
+
+	if (context.isGroupChat) {
+		return _resolveGroupLock(context, preferences);
+	} else {
+		return _resolveSingleLock(context, lockingMode, preferPrimaryOverChat);
+	}
+}
+
+/**
+ * Resolve lock for single chat
+ * @private
+ */
+function _resolveSingleLock(context, lockingMode, preferPrimaryOverChat) {
+	// Determine which lock is "primary" based on locking mode
+	const isPrimaryModel = lockingMode === LOCKING_MODES.MODEL;
+	const primaryKey = isPrimaryModel ? context.modelName : context.characterName;
+	const primarySource = isPrimaryModel ? SETTING_SOURCES.MODEL : SETTING_SOURCES.CHARACTER;
+
+	// Get locks
+	const primaryLock = isPrimaryModel
+		? Storage.getModelLock(primaryKey)
+		: Storage.getCharacterLock(primaryKey);
+	const chatLock = Storage.getChatLock();
+
+	// Apply priority
+	if (preferPrimaryOverChat) {
+		// Primary (model/character) > chat
+		if (primaryLock) {
+			return { templateId: primaryLock, source: primarySource };
+		}
+		if (chatLock) {
+			return { templateId: chatLock, source: `${SETTING_SOURCES.CHAT} (fallback)` };
+		}
+	} else {
+		// Chat > primary (model/character)
+		if (chatLock) {
+			return { templateId: chatLock, source: SETTING_SOURCES.CHAT };
+		}
+		if (primaryLock) {
+			return { templateId: primaryLock, source: `${primarySource} (fallback)` };
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Resolve lock for group chat
+ * @private
+ */
+function _resolveGroupLock(context, preferences) {
+	const { lockingMode, preferGroupOverChat, preferIndividualCharacterInGroup } = preferences;
+
+	// Get all possible locks
+	const groupLock = Storage.getGroupLock(context.groupId);
+	const chatLock = Storage.getChatLock();
+
+	// Individual character lock (based on locking mode)
+	const isPrimaryModel = lockingMode === LOCKING_MODES.MODEL;
+	const primaryKey = isPrimaryModel ? context.modelName : context.characterName;
+	const primaryLock = isPrimaryModel
+		? Storage.getModelLock(primaryKey)
+		: Storage.getCharacterLock(primaryKey);
+
+	// Apply group priority rules
+	if (preferIndividualCharacterInGroup) {
+		// Individual character/model > group > chat
+		if (primaryLock) {
+			const source = isPrimaryModel ? 'model' : 'character';
+			return { templateId: primaryLock, source };
+		}
+		if (groupLock) {
+			return { templateId: groupLock, source: SETTING_SOURCES.GROUP };
+		}
+		if (chatLock) {
+			return { templateId: chatLock, source: SETTING_SOURCES.GROUP_CHAT };
+		}
+	} else if (preferGroupOverChat) {
+		// Group > chat > individual character/model
+		if (groupLock) {
+			return { templateId: groupLock, source: SETTING_SOURCES.GROUP };
+		}
+		if (chatLock) {
+			return { templateId: chatLock, source: SETTING_SOURCES.GROUP_CHAT };
+		}
+		if (primaryLock) {
+			const source = isPrimaryModel ? 'model' : 'character';
+			return { templateId: primaryLock, source: `${source} (fallback)` };
+		}
+	} else {
+		// Chat > group > individual character/model
+		if (chatLock) {
+			return { templateId: chatLock, source: SETTING_SOURCES.GROUP_CHAT };
+		}
+		if (groupLock) {
+			return { templateId: groupLock, source: SETTING_SOURCES.GROUP };
+		}
+		if (primaryLock) {
+			const source = isPrimaryModel ? 'model' : 'character';
+			return { templateId: primaryLock, source: `${source} (fallback)` };
+		}
+	}
+
+	return null;
+}
+
+// ============================================================================
+// APPLY TEMPLATE ACTION (Side Effect)
+// ============================================================================
+
+/**
+ * Apply template to current ST settings
+ * Side effect function - modifies oai_settings and calls promptManager
+ * @param {string} templateId
+ * @returns {Promise<boolean>} Success status
+ */
+async function applyTemplate(templateId) {
+	const template = Storage.getTemplate(templateId);
+	if (!template) {
+		console.error('CCPM: Template not found:', templateId);
+		return false;
+	}
+
+	if (!promptManager) {
+		console.error('CCPM: PromptManager not available');
+		return false;
+	}
+
+	try {
+		// Replace entire prompts array
+		oai_settings.prompts = Object.values(template.prompts);
+
+		// Restore prompt order if saved in template
+		if (template.promptOrder?.length > 0) {
+			const targetCharacterId = template.promptOrderCharacterId ?? 100000;
+
+			// Find or create order entry for this character
+			const existingOrderEntry = oai_settings.prompt_order?.find(
+				entry => String(entry.character_id) === String(targetCharacterId)
+			);
+
+			if (existingOrderEntry) {
+				// Replace existing order
+				existingOrderEntry.order = [...template.promptOrder];
+			} else {
+				// Add new order entry
+				if (!oai_settings.prompt_order) {
+					oai_settings.prompt_order = [];
+				}
+				oai_settings.prompt_order.push({
+					character_id: targetCharacterId,
+					order: [...template.promptOrder]
+				});
+			}
+
+			// Update promptManager's activeCharacter to match
+			if (promptManager.activeCharacter) {
+				promptManager.activeCharacter.id = targetCharacterId;
+			}
+		}
+
+		// Save and render
+		await promptManager.saveServiceSettings();
+		await promptManager.render();
+
+		console.log('CCPM: Applied template:', template.name);
+		return true;
+	} catch (error) {
+		console.error('CCPM: Failed to apply template:', error);
+		return false;
+	}
+}
+
+// ============================================================================
+// UPDATE DISPLAY ACTION (Side Effect)
+// ============================================================================
+
+/**
+ * Update display box in ST's prompt manager UI
+ * Side effect function - modifies DOM
+ * @param {string|null} appliedTemplateId - ID of currently applied template (null = preset default)
+ * @param {Object|null} lockInfo - Lock info from resolveLock() {templateId, source}
+ */
+function updateDisplay(appliedTemplateId = null, lockInfo = null) {
+	const promptList = document.getElementById('completion_prompt_manager_list');
+	if (!promptList) return;
+
+	// Remove existing indicator
+	const existing = document.getElementById('ccpm-template-indicator');
+	if (existing) existing.remove();
+
+	// Build display HTML
+	const html = _buildDisplayHtml(appliedTemplateId, lockInfo);
+	if (!html) return; // Nothing to display
+
+	// Create and insert indicator
+	const indicator = document.createElement('div');
+	indicator.id = 'ccpm-template-indicator';
+	indicator.className = 'ccpm-template-status';
+	indicator.innerHTML = `<small class="text_muted">${html}</small>`;
+	promptList.insertAdjacentElement('beforebegin', indicator);
+}
+
+/**
+ * Build HTML for display indicator
+ * @private
+ */
+function _buildDisplayHtml(appliedId, lock) {
+	const hasLock = lock?.templateId;
+	const hasMismatch = hasLock && appliedId !== lock.templateId;
+
+	if (hasMismatch) {
+		// Show both locked and applied (mismatch state)
+		const lockedTemplate = Storage.getTemplate(lock.templateId);
+		if (!lockedTemplate) return null;
+
+		let appliedText = 'Preset default';
+		if (appliedId) {
+			const appliedTemplate = Storage.getTemplate(appliedId);
+			appliedText = appliedTemplate ? escapeHtml(appliedTemplate.name) : 'Unknown template';
+		}
+
+		return `
+			<div><span class="fa-solid fa-lock"></span> Locked: <strong>${escapeHtml(lockedTemplate.name)}</strong> <span class="text_muted">(${escapeHtml(lock.source)})</span></div>
+			<div><span class="fa-solid fa-file-lines"></span> Applied: <strong>${appliedText}</strong></div>
+		`;
+	}
+
+	if (appliedId) {
+		// Something is applied (may or may not be locked)
+		const template = Storage.getTemplate(appliedId);
+		if (!template) return null;
+
+		if (hasLock) {
+			// Applied and locked (matching state)
+			return `<span class="fa-solid fa-lock"></span> Prompt Template: <strong>${escapeHtml(template.name)}</strong> <span class="text_muted">(${escapeHtml(lock.source)})</span>`;
+		} else {
+			// Applied but not locked
+			return `<span class="fa-solid fa-file-lines"></span> Prompt Template: <strong>${escapeHtml(template.name)}</strong>`;
+		}
+	}
+
+	if (hasLock) {
+		// Locked but not applied
+		const lockedTemplate = Storage.getTemplate(lock.templateId);
+		if (!lockedTemplate) return null;
+
+		return `
+			<div><span class="fa-solid fa-lock"></span> Locked: <strong>${escapeHtml(lockedTemplate.name)}</strong> <span class="text_muted">(${escapeHtml(lock.source)})</span></div>
+			<div><span class="fa-solid fa-file-lines"></span> Applied: <strong>Preset default</strong></div>
+		`;
+	}
+
+	// Nothing to display
+	return null;
+}
+
+// ============================================================================
+// AUTO-APPLY ORCHESTRATION
+// ============================================================================
+
+/**
+ * Handle auto-apply logic - the main orchestration function
+ * Coordinates: context resolution → lock resolution → user prompt → apply → display
+ * @param {string} reason - 'chat' or 'preset' (for user messaging)
+ */
+async function handleAutoApply(reason = 'chat') {
+	console.log('CCPM NEW: handleAutoApply called, reason:', reason);
+
+	const context = resolveContext();
+	console.log('CCPM NEW: context:', context);
+
+	const preferences = Storage.getPreferences();
+	console.log('CCPM NEW: preferences:', preferences);
+
+	const lock = resolveLock(context, preferences);
+	console.log('CCPM NEW: resolved lock:', lock);
+
+	// No lock exists - clear display
+	if (!lock?.templateId) {
+		console.log('CCPM NEW: No lock found, clearing display');
+		updateDisplay(null, null);
+		return;
+	}
+
+	const { autoApplyMode } = preferences;
+	console.log('CCPM NEW: autoApplyMode:', autoApplyMode);
+
+	// NEVER mode - show lock but don't apply
+	if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
+		updateDisplay(null, lock);
+		return;
+	}
+
+	// ASK mode - prompt user
+	if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
+		const template = Storage.getTemplate(lock.templateId);
+		if (!template) {
+			updateDisplay(null, null);
+			return;
+		}
+
+		const userApproved = await _askUserToApply(template, lock, reason, context);
+
+		if (userApproved) {
+			const success = await applyTemplate(lock.templateId);
+			if (success) {
+				toastr.success(`Applied template: ${template.name}`);
+				updateDisplay(lock.templateId, lock);
+			} else {
+				toastr.error('Failed to apply template');
+				updateDisplay(null, lock);
+			}
+		} else {
+			// User skipped - show mismatch (locked but not applied)
+			updateDisplay(null, lock);
+		}
+		return;
+	}
+
+	// ALWAYS mode - auto-apply without asking
+	if (autoApplyMode === AUTO_APPLY_MODES.ALWAYS) {
+		const template = Storage.getTemplate(lock.templateId);
+		if (!template) {
+			updateDisplay(null, null);
+			return;
+		}
+
+		const success = await applyTemplate(lock.templateId);
+		if (success) {
+			const message = reason === 'chat' ? `Auto-applied template: ${template.name}` : `Auto-reapplied template: ${template.name}`;
+			toastr.info(message);
+			updateDisplay(lock.templateId, lock);
+		} else {
+			toastr.error('Failed to auto-apply template');
+			updateDisplay(null, lock);
+		}
+		return;
+	}
+}
+
+/**
+ * Ask user whether to apply template
+ * @private
+ */
+async function _askUserToApply(template, lock, reason, context) {
+	const title = reason === 'chat' ? 'Chat Changed' : 'Preset Changed';
+	const contextType = context.isGroupChat ? 'group chat' : 'character';
+	const sourceName = context.groupName || context.characterName || 'Unknown';
+
+	const message = reason === 'chat'
+		? `Apply locked template "<strong>${escapeHtml(template.name)}</strong>" for ${contextType} "${escapeHtml(sourceName)}"?`
+		: `Reapply locked template "<strong>${escapeHtml(template.name)}</strong>" for ${contextType} "${escapeHtml(sourceName)}"?`;
+
+	const popup = new Popup(`
+		<div class="flex-container flexFlowColumn flexGap10">
+			<h4>${title}</h4>
+			<p>${message}</p>
+			<p class="text_muted fontsize90p">Source: ${escapeHtml(lock.source)}</p>
+		</div>
+	`, POPUP_TYPE.CONFIRM, '', {
+		okButton: 'Apply',
+		cancelButton: 'Skip',
+		allowVerticalScrolling: true
+	});
+
+	const result = await popup.show();
+	return result === POPUP_RESULT.AFFIRMATIVE;
+}
+
+// ============================================================================
+// NEW EVENT HANDLERS (Using Modular Architecture)
+// ============================================================================
+
+/**
+ * New simplified event handlers using the modular architecture
+ * TODO: Replace old PromptTemplateManager event handlers with these
+ */
+const NewEventHandlers = {
+	/**
+	 * Handle CHAT_CHANGED event
+	 */
+	async onChatChanged() {
+		await handleAutoApply('chat');
+	},
+
+	/**
+	 * Handle OAI_PRESET_CHANGED_AFTER event (model changes)
+	 */
+	async onPresetChanged() {
+		const preferences = Storage.getPreferences();
+
+		// Only handle in model mode
+		if (preferences.lockingMode !== LOCKING_MODES.MODEL) {
+			return;
+		}
+
+		await handleAutoApply('preset');
+	},
+
+	/**
+	 * Handle SETTINGS_UPDATED event
+	 * Just refresh display, don't auto-apply
+	 */
+	onSettingsUpdated() {
+		const context = resolveContext();
+		const preferences = Storage.getPreferences();
+		const lock = resolveLock(context, preferences);
+
+		// Just update display, don't trigger auto-apply
+		updateDisplay(null, lock);
+	},
+
+	/**
+	 * Manual apply from UI button
+	 * @param {string} templateId
+	 */
+	async applyTemplateManual(templateId) {
+		const success = await applyTemplate(templateId);
+
+		if (success) {
+			const template = Storage.getTemplate(templateId);
+			toastr.success(`Template applied: ${template.name}`);
+
+			// Update display
+			const context = resolveContext();
+			const preferences = Storage.getPreferences();
+			const lock = resolveLock(context, preferences);
+			updateDisplay(templateId, lock);
+		} else {
+			toastr.error('Failed to apply template');
+		}
+
+		return success;
+	},
+
+	/**
+	 * Create template from current prompts
+	 * @param {string} name
+	 * @param {string} description
+	 * @param {Array<string>} includePrompts
+	 */
+	createTemplate(name, description, includePrompts = null) {
+		const template = TemplateOps.createFromCurrent({ name, description, includePrompts });
+		Storage.saveTemplate(template);
+		console.log('CCPM: Created template:', template.name);
+		return template;
+	},
+
+	/**
+	 * Delete template
+	 * @param {string} templateId
+	 */
+	deleteTemplate(templateId) {
+		const success = Storage.deleteTemplate(templateId);
+		if (success) {
+			console.log('CCPM: Deleted template:', templateId);
+		}
+		return success;
+	},
+
+	/**
+	 * Set lock for target
+	 * @param {string} templateId
+	 * @param {string} target - 'character', 'model', 'chat', 'group'
+	 */
+	async setLock(templateId, target) {
+		const context = resolveContext();
+		const preferences = Storage.getPreferences();
+
+		switch (target) {
+			case 'character':
+				if (context.characterName) {
+					Storage.setCharacterLock(context.characterName, templateId);
+				}
+				break;
+			case 'model':
+				if (context.modelName) {
+					Storage.setModelLock(context.modelName, templateId);
+				}
+				break;
+			case 'chat':
+				Storage.setChatLock(templateId);
+				break;
+			case 'group':
+				if (context.groupId) {
+					Storage.setGroupLock(context.groupId, templateId);
+				}
+				break;
+		}
+
+		// Update display after locking
+		const lock = resolveLock(context, preferences);
+		updateDisplay(null, lock);
+	},
+
+	/**
+	 * Clear lock for target
+	 * @param {string} target - 'character', 'model', 'chat', 'group'
+	 */
+	async clearLock(target) {
+		const context = resolveContext();
+		const preferences = Storage.getPreferences();
+
+		switch (target) {
+			case 'character':
+				if (context.characterName) {
+					Storage.clearCharacterLock(context.characterName);
+				}
+				break;
+			case 'model':
+				if (context.modelName) {
+					Storage.clearModelLock(context.modelName);
+				}
+				break;
+			case 'chat':
+				Storage.clearChatLock();
+				break;
+			case 'group':
+				if (context.groupId) {
+					Storage.clearGroupLock(context.groupId);
+				}
+				break;
+		}
+
+		// Update display after clearing
+		const lock = resolveLock(context, preferences);
+		updateDisplay(null, lock);
+	}
+};
+
+// Expose for testing alongside old code
+window.ccpmNewHandlers = NewEventHandlers;
+
+// ============================================================================
+// UI HELPER FUNCTIONS (Adapter for UI code)
+// ============================================================================
+
+/**
+ * UI Helper functions that bridge the UI code to the new modular architecture
+ * These replace the old promptTemplateManager instance methods
+ */
+const UIHelpers = {
+	/**
+	 * List all templates
+	 * @returns {Array<Object>} Array of template objects
+	 */
+	listTemplates() {
+		const templates = Storage.getAllTemplates();
+		return Array.from(templates.values());
+	},
+
+	/**
+	 * Get single template by ID
+	 * @param {string} id
+	 * @returns {Object|null}
+	 */
+	getTemplate(id) {
+		return Storage.getTemplate(id);
+	},
+
+	/**
+	 * Get current locks for all targets
+	 * @returns {Object} {character, model, chat, group}
+	 */
+	async getCurrentLocks() {
+		const context = resolveContext();
+		return {
+			character: Storage.getCharacterLock(context.characterName),
+			model: Storage.getModelLock(context.modelName),
+			chat: Storage.getChatLock(),
+			group: context.groupId ? Storage.getGroupLock(context.groupId) : null
+		};
+	},
+
+	/**
+	 * Get effective lock (which lock applies based on priority)
+	 * @returns {Object|null} {templateId, source} or null
+	 */
+	async getEffectiveLock() {
+		const context = resolveContext();
+		const preferences = Storage.getPreferences();
+		const lock = resolveLock(context, preferences);
+		return lock || { templateId: null, source: null };
+	},
+
+	/**
+	 * Apply template by ID
+	 * @param {string} templateId
+	 * @returns {Promise<boolean>}
+	 */
+	async applyTemplate(templateId) {
+		return await NewEventHandlers.applyTemplateManual(templateId);
+	},
+
+	/**
+	 * Delete template by ID
+	 * @param {string} id
+	 * @returns {boolean}
+	 */
+	deleteTemplate(id) {
+		return NewEventHandlers.deleteTemplate(id);
+	},
+
+	/**
+	 * Create template from current prompts
+	 * @param {string} name
+	 * @param {string} description
+	 * @param {Array<string>} includePrompts - Array of prompt identifiers to include
+	 * @returns {Object} Created template
+	 */
+	createTemplateFromCurrent(name, description, includePrompts) {
+		return NewEventHandlers.createTemplate(name, description, includePrompts);
+	},
+
+	/**
+	 * Update template
+	 * @param {string} id
+	 * @param {Object} updates
+	 * @returns {Object|null} Updated template or null
+	 */
+	updateTemplate(id, updates) {
+		const template = Storage.getTemplate(id);
+		if (!template) return null;
+
+		const updated = TemplateOps.update(template, updates);
+		Storage.saveTemplate(updated);
+		return updated;
+	},
+
+	/**
+	 * Lock template to target
+	 * @param {string} templateId
+	 * @param {string} target - 'character', 'model', 'chat', or 'group'
+	 * @returns {Promise<boolean>}
+	 */
+	async lockTemplate(templateId, target) {
+		await NewEventHandlers.setLock(templateId, target);
+		return true;
+	},
+
+	/**
+	 * Clear lock for target
+	 * @param {string} target
+	 * @returns {Promise<boolean>}
+	 */
+	async clearTemplateLock(target) {
+		await NewEventHandlers.clearLock(target);
+		return true;
+	},
+
+	/**
+	 * Export all templates
+	 * @returns {Array<Object>}
+	 */
+	exportTemplates() {
+		return this.listTemplates();
+	},
+
+	/**
+	 * Import templates
+	 * @param {Array<Object>} templatesArray
+	 * @returns {Object} {imported: number, skipped: number}
+	 */
+	importTemplates(templatesArray) {
+		let imported = 0;
+		let skipped = 0;
+
+		for (const data of templatesArray) {
+			const valid = TemplateOps.validate(data);
+			if (valid) {
+				Storage.saveTemplate(data);
+				imported++;
+			} else {
+				skipped++;
+			}
+		}
+
+		return { imported, skipped };
+	},
+
+	/**
+	 * Save settings (called by UI after changes)
+	 */
+	saveSettings() {
+		// Storage module auto-saves, but UI expects this method
+		// Just ensure debounced save is called
+		saveSettingsDebounced();
+	},
+
+	/**
+	 * Compatibility property for old code that accesses lockManager.chatContext
+	 * Provides getCurrent() and invalidate() methods
+	 */
+	lockManager: {
+		chatContext: {
+			getCurrent() {
+				return resolveContext();
+			},
+			invalidate() {
+				// New architecture doesn't cache, so this is a no-op
+				// Keep for compatibility
+			}
+		}
+	}
+};
+
+// Expose UIHelpers globally for UI code
+window.promptTemplateManager = UIHelpers;
+
 // Utility functions
 const getCurrentChatMetadata = () => chat_metadata;
 
 /**
  * Inject current CCPM template name into ST's prompt manager UI
+ * @param {string|null} appliedTemplateId - ID of template currently applied, or null for preset default
+ * @param {Object|null} effectiveLock - Lock object {templateId, source} or null if no lock
  */
-function injectTemplateNameIntoPromptManager() {
+function injectTemplateNameIntoPromptManager(appliedTemplateId = null, effectiveLock = null) {
 	if (!promptTemplateManager) return;
 
 	// Find ST's prompt manager list
@@ -52,1638 +1288,116 @@ function injectTemplateNameIntoPromptManager() {
 	const existing = document.getElementById('ccpm-template-indicator');
 	if (existing) existing.remove();
 
-	// Get current effective lock
-	promptTemplateManager.getEffectiveLock().then(effectiveLock => {
-		let statusHtml = '';
+	let statusHtml = '';
 
-		// Check if manually applied template differs from locked template
-		const hasLock = effectiveLock && effectiveLock.templateId;
-		const hasManualOverride = lastAppliedTemplateId && lastAppliedTemplateId !== effectiveLock?.templateId;
+	// Check if there's a mismatch between what's locked and what's applied
+	const hasLock = effectiveLock && effectiveLock.templateId;
+	const hasMismatch = hasLock && appliedTemplateId !== effectiveLock.templateId;
 
-		if (hasManualOverride) {
-			// Case 1: Manual override - show both locked and applied
-			const lockedTemplate = promptTemplateManager.getTemplate(effectiveLock.templateId);
-			const appliedTemplate = promptTemplateManager.getTemplate(lastAppliedTemplateId);
+	if (hasMismatch) {
+		// Show both locked and applied
+		const lockedTemplate = promptTemplateManager.getTemplate(effectiveLock.templateId);
 
-			if (!appliedTemplate) return;
+		if (lockedTemplate) {
+			let appliedText = 'Preset default';
+			if (appliedTemplateId) {
+				const appliedTemplate = promptTemplateManager.getTemplate(appliedTemplateId);
+				appliedText = appliedTemplate ? escapeHtml(appliedTemplate.name) : 'Unknown template';
+			}
 
 			statusHtml = `
 				<div><span class="fa-solid fa-lock"></span> Locked: <strong>${escapeHtml(lockedTemplate.name)}</strong> <span class="text_muted">(${escapeHtml(effectiveLock.source)})</span></div>
-				<div><span class="fa-solid fa-file-lines"></span> Applied: <strong>${escapeHtml(appliedTemplate.name)}</strong> <span class="text_muted">(manual override)</span></div>
+				<div><span class="fa-solid fa-file-lines"></span> Applied: <strong>${appliedText}</strong></div>
 			`;
-		} else if (hasLock) {
-			// Case 2: Template is locked and active (no override)
-			const template = promptTemplateManager.getTemplate(effectiveLock.templateId);
-			if (!template) return;
-
-			statusHtml = `<span class="fa-solid fa-lock"></span> Prompt Template: <strong>${escapeHtml(template.name)}</strong> <span class="text_muted">(${escapeHtml(effectiveLock.source)})</span>`;
-		} else if (lastAppliedTemplateId) {
-			// Case 3: Template was manually applied (no lock exists)
-			const template = promptTemplateManager.getTemplate(lastAppliedTemplateId);
-			if (template) {
-				statusHtml = `<span class="fa-solid fa-file-lines"></span> Prompt Template: <strong>${escapeHtml(template.name)}</strong> <span class="text_muted">(applied)</span>`;
+		}
+	} else if (appliedTemplateId) {
+		// Something is applied (may or may not be locked)
+		const template = promptTemplateManager.getTemplate(appliedTemplateId);
+		if (template) {
+			if (hasLock) {
+				statusHtml = `<span class="fa-solid fa-lock"></span> Prompt Template: <strong>${escapeHtml(template.name)}</strong> <span class="text_muted">(${escapeHtml(effectiveLock.source)})</span>`;
 			} else {
-				// Template was deleted after being applied
+				statusHtml = `<span class="fa-solid fa-file-lines"></span> Prompt Template: <strong>${escapeHtml(template.name)}</strong>`;
+			}
+		}
+	}
+
+	if (!statusHtml) {
+		// Nothing applied, show default or just the lock
+		if (hasLock) {
+			const lockedTemplate = promptTemplateManager.getTemplate(effectiveLock.templateId);
+			if (lockedTemplate) {
+				statusHtml = `
+					<div><span class="fa-solid fa-lock"></span> Locked: <strong>${escapeHtml(lockedTemplate.name)}</strong> <span class="text_muted">(${escapeHtml(effectiveLock.source)})</span></div>
+					<div><span class="fa-solid fa-file-lines"></span> Applied: <strong>Preset default</strong></div>
+				`;
+			} else {
 				statusHtml = '<span class="fa-solid fa-circle-info"></span> No prompt template applied, using preset default';
 			}
 		} else {
-			// Case 4: No lock, no manual application
 			statusHtml = '<span class="fa-solid fa-circle-info"></span> No prompt template applied, using preset default';
 		}
+	}
 
-		// Create template indicator element
-		const indicator = document.createElement('div');
-		indicator.id = 'ccpm-template-indicator';
-		indicator.className = 'ccpm-template-indicator';
-		indicator.innerHTML = `<small class="text_muted">${statusHtml}</small>`;
+	// Create template indicator element
+	const indicator = document.createElement('div');
+	indicator.id = 'ccpm-template-indicator';
+	indicator.className = 'ccpm-template-indicator';
+	indicator.innerHTML = `<small class="text_muted">${statusHtml}</small>`;
 
-		// Insert before the prompt list
-		promptList.insertAdjacentElement('beforebegin', indicator);
-	}).catch(() => {
-		// Silent fail if lock retrieval fails
-	});
+	// Insert before the prompt list
+	promptList.insertAdjacentElement('beforebegin', indicator);
 }
 
-// ===== LOCKING SYSTEM CLASSES =====
-
-/**
- * Centralized chat context detection and management
- */
-class ChatContext {
-    constructor() {
-        this.cache = new Map();
-        this.cacheTime = 0;
-    }
-
-    getCurrent() {
-        const now = Date.now();
-        if (now - this.cacheTime < CACHE_TTL && this.cache.has('current')) {
-            return this.cache.get('current');
-        }
-
-        try {
-            const context = this._buildContext();
-            this.cache.set('current', context);
-            this.cacheTime = now;
-            return context;
-        } catch (error) {
-            toastr.error('CCPM: Error building context:', error);
-            if (this.cache.has('current')) {
-                toastr.warning('CCPM: Using stale cached context due to build error');
-                return this.cache.get('current');
-            }
-            throw error;
-        }
-    }
-
-    invalidate() {
-        this.cache.clear();
-        this.cacheTime = 0;
-    }
-
-    _buildContext() {
-        const isGroupChat = !!selected_group;
-
-        if (isGroupChat) {
-            return this._buildGroupContext();
-        } else {
-            return this._buildSingleContext();
-        }
-    }
-
-    _buildGroupContext() {
-        const groupId = selected_group;
-        const group = groups?.find(x => x.id === groupId);
-        const modelName = this._getCurrentModelName();
-
-        return {
-            type: CHAT_TYPES.GROUP,
-            isGroupChat: true,
-            groupId,
-            groupName: group?.name || null,
-            chatId: group?.chat_id || null,
-            chatName: group?.name || null,
-            characterName: group?.name || null,
-            modelName,
-            primaryId: groupId,
-            secondaryId: group?.chat_id
-        };
-    }
-
-    _buildSingleContext() {
-        const characterName = this._getCharacterNameForSettings();
-        const modelName = this._getCurrentModelName();
-        const chatId = this._getCurrentChatId();
-
-        // Determine primaryId based on lockingMode
-        const lockingMode = extension_settings.ccPromptManager?.lockingMode || LOCKING_MODES.MODEL;
-        const primaryId = lockingMode === LOCKING_MODES.MODEL ? modelName : characterName;
-
-        return {
-            type: CHAT_TYPES.SINGLE,
-            isGroupChat: false,
-            groupId: null,
-            groupName: null,
-            chatId,
-            chatName: chatId,
-            characterName,
-            modelName,
-            primaryId,
-            secondaryId: chatId
-        };
-    }
-
-    _getCharacterNameForSettings() {
-        let characterName = name2;
-
-        if (!characterName || characterName === systemUserName || characterName === neutralCharacterName) {
-            characterName = this._getCharacterNameFromChatMetadata();
-        }
-
-        if (!characterName) {
-            return null;
-        }
-
-        characterName = String(characterName).trim();
-        if (characterName.normalize) {
-            characterName = characterName.normalize('NFC');
-        }
-
-        return characterName;
-    }
-
-    _getCharacterNameFromChatMetadata() {
-        try {
-            const metadata = getCurrentChatMetadata();
-            const characterName = metadata?.character_name;
-            return characterName && typeof characterName === 'string' ? characterName.trim() : null;
-        } catch (error) {
-            return null;
-        }
-    }
-
-    _getCurrentChatId() {
-        try {
-            const context = getContext();
-            return context?.chatId || null;
-        } catch (error) {
-            return null;
-        }
-    }
-
-    _getCurrentModelName() {
-        return oai_settings.model || null;
-    }
-}
-
-/**
- * Centralized storage operations for template locking
- */
-class TemplateStorageAdapter {
-    constructor() {
-        this.EXTENSION_KEY = MODULE_NAME;
-    }
-
-    getExtensionSettings() {
-        if (!extension_settings[this.EXTENSION_KEY]) {
-            extension_settings[this.EXTENSION_KEY] = {
-                templates: {},
-                templateLocks: {},
-                version: '1.0.0'
-            };
-        }
-        return extension_settings[this.EXTENSION_KEY];
-    }
-
-    saveExtensionSettings() {
-        saveSettingsDebounced();
-    }
-
-    // Character template locks
-    getCharacterTemplateLock(characterKey) {
-        if (characterKey === undefined || characterKey === null) {
-            return null;
-        }
-
-        const extensionSettings = this.getExtensionSettings();
-        const chIdKey = String(characterKey);
-        return extensionSettings.templateLocks?.character?.[chIdKey] || null;
-    }
-
-    setCharacterTemplateLock(characterKey, templateId) {
-        if (characterKey === undefined || characterKey === null) {
-            return false;
-        }
-
-        const extensionSettings = this.getExtensionSettings();
-
-        if (!extensionSettings.templateLocks) {
-            extensionSettings.templateLocks = {};
-        }
-        if (!extensionSettings.templateLocks.character) {
-            extensionSettings.templateLocks.character = {};
-        }
-
-        const saveKey = String(characterKey);
-        extensionSettings.templateLocks.character[saveKey] = templateId;
-        this.saveExtensionSettings();
-        return true;
-    }
-
-    deleteCharacterTemplateLock(characterKey) {
-        if (characterKey === undefined || characterKey === null) {
-            return false;
-        }
-
-        const extensionSettings = this.getExtensionSettings();
-        const chIdKey = String(characterKey);
-
-        if (extensionSettings.templateLocks?.character?.[chIdKey]) {
-            delete extensionSettings.templateLocks.character[chIdKey];
-            this.saveExtensionSettings();
-            return true;
-        }
-
-        return false;
-    }
-
-    // Model template locks
-    getModelTemplateLock(modelKey) {
-        if (modelKey === undefined || modelKey === null) {
-            return null;
-        }
-
-        const extensionSettings = this.getExtensionSettings();
-        const saveKey = String(modelKey);
-        return extensionSettings.templateLocks?.model?.[saveKey] || null;
-    }
-
-    setModelTemplateLock(modelKey, templateId) {
-        if (modelKey === undefined || modelKey === null) {
-            return false;
-        }
-
-        const extensionSettings = this.getExtensionSettings();
-
-        if (!extensionSettings.templateLocks) {
-            extensionSettings.templateLocks = {};
-        }
-        if (!extensionSettings.templateLocks.model) {
-            extensionSettings.templateLocks.model = {};
-        }
-
-        const saveKey = String(modelKey);
-        extensionSettings.templateLocks.model[saveKey] = templateId;
-        this.saveExtensionSettings();
-        return true;
-    }
-
-    deleteModelTemplateLock(modelKey) {
-        if (modelKey === undefined || modelKey === null) {
-            return false;
-        }
-
-        const extensionSettings = this.getExtensionSettings();
-        const saveKey = String(modelKey);
-
-        if (extensionSettings.templateLocks?.model?.[saveKey]) {
-            delete extensionSettings.templateLocks.model[saveKey];
-            this.saveExtensionSettings();
-            return true;
-        }
-
-        return false;
-    }
-
-    // Group template locks
-    getGroupTemplateLock(groupId) {
-        if (!groupId) {
-            return null;
-        }
-
-        try {
-            const group = groups?.find(x => x.id === groupId);
-            return group?.ccpm_template_lock || null;
-        } catch (error) {
-            toastr.warning('CCPM: Error getting group template lock:', error);
-            return null;
-        }
-    }
-
-    async setGroupTemplateLock(groupId, templateId) {
-        if (!groupId) {
-            return false;
-        }
-
-        try {
-            const group = groups?.find(x => x.id === groupId);
-            if (!group) {
-                toastr.warning('CCPM: Cannot save group template lock - group not found');
-                return false;
-            }
-
-            group.ccpm_template_lock = templateId;
-            await editGroup(groupId, false, false);
-            return true;
-        } catch (error) {
-            toastr.error('CCPM: Error saving group template lock:', error);
-            return false;
-        }
-    }
-
-    async deleteGroupTemplateLock(groupId) {
-        if (!groupId) {
-            return false;
-        }
-
-        try {
-            const group = groups?.find(x => x.id === groupId);
-            if (group?.ccpm_template_lock) {
-                delete group.ccpm_template_lock;
-                await editGroup(groupId, false, false);
-                return true;
-            }
-            return false;
-        } catch (error) {
-            toastr.error('CCPM: Error deleting group template lock:', error);
-            return false;
-        }
-    }
-
-    // Chat template locks
-    getChatTemplateLock() {
-        try {
-            const metadata = getCurrentChatMetadata();
-            return metadata?.[this.EXTENSION_KEY]?.templateLock || null;
-        } catch (error) {
-            toastr.warning('CCPM: Error getting chat template lock:', error);
-            return null;
-        }
-    }
-
-    setChatTemplateLock(templateId) {
-        try {
-            const metadata = getCurrentChatMetadata();
-            if (!metadata) {
-                toastr.warning('CCPM: Cannot save chat template lock - no chat metadata available');
-                return false;
-            }
-
-            if (!metadata[this.EXTENSION_KEY]) {
-                metadata[this.EXTENSION_KEY] = {};
-            }
-            metadata[this.EXTENSION_KEY].templateLock = templateId;
-            this._triggerMetadataSave();
-            return true;
-        } catch (error) {
-            toastr.error('CCPM: Error saving chat template lock:', error);
-            return false;
-        }
-    }
-
-    deleteChatTemplateLock() {
-        try {
-            const metadata = getCurrentChatMetadata();
-            if (metadata?.[this.EXTENSION_KEY]?.templateLock) {
-                delete metadata[this.EXTENSION_KEY].templateLock;
-                this._triggerMetadataSave();
-                return true;
-            }
-            return false;
-        } catch (error) {
-            toastr.error('CCPM: Error deleting chat template lock:', error);
-            return false;
-        }
-    }
-
-    // Group chat template locks
-    getGroupChatTemplateLock(groupId) {
-        if (!groupId) {
-            return null;
-        }
-
-        try {
-            return (typeof chat_metadata !== 'undefined') ? chat_metadata[this.EXTENSION_KEY]?.templateLock || null : null;
-        } catch (error) {
-            toastr.warning('CCPM: Error getting group chat template lock:', error);
-            return null;
-        }
-    }
-
-    async setGroupChatTemplateLock(groupId, templateId) {
-        if (!groupId) {
-            return false;
-        }
-
-        try {
-            if (typeof chat_metadata !== 'undefined') {
-                if (!chat_metadata[this.EXTENSION_KEY]) {
-                    chat_metadata[this.EXTENSION_KEY] = {};
-                }
-                chat_metadata[this.EXTENSION_KEY].templateLock = templateId;
-                return true;
-            }
-            return false;
-        } catch (error) {
-            toastr.error('CCPM: Error saving group chat template lock:', error);
-            return false;
-        }
-    }
-
-    async deleteGroupChatTemplateLock(groupId) {
-        if (!groupId) {
-            return false;
-        }
-
-        try {
-            if (typeof chat_metadata !== 'undefined' && chat_metadata[this.EXTENSION_KEY]?.templateLock) {
-                delete chat_metadata[this.EXTENSION_KEY].templateLock;
-                return true;
-            }
-            return false;
-        } catch (error) {
-            toastr.error('CCPM: Error deleting group chat template lock:', error);
-            return false;
-        }
-    }
-
-    _triggerMetadataSave() {
-        try {
-            saveMetadataDebounced();
-        } catch (error) {
-            toastr.error('CCPM: Error triggering metadata save:', error);
-        }
-    }
-}
-
-/**
- * Template lock priority resolution
- */
-class TemplateLockResolver {
-    constructor(extensionSettings) {
-        this.extensionSettings = extensionSettings;
-    }
-
-    resolve(context, availableLocks) {
-        if (context.isGroupChat) {
-            return this._resolveGroupLocks(context, availableLocks);
-        } else {
-            return this._resolveSingleLocks(context, availableLocks);
-        }
-    }
-
-    _resolveGroupLocks(context, locks) {
-        const prefs = this.extensionSettings;
-        const { group, chat, character, model } = locks;
-
-        // Determine primary lock based on lockingMode
-        const lockingMode = prefs.lockingMode || LOCKING_MODES.MODEL;
-        const primaryLock = lockingMode === LOCKING_MODES.MODEL ? model : character;
-        const primarySource = lockingMode === LOCKING_MODES.MODEL ? 'model' : 'character';
-
-        // Use user-defined priorities for group chats
-        if (prefs.preferIndividualCharacterInGroup && primaryLock) {
-            return { templateId: primaryLock, source: primarySource };
-        }
-
-        if (prefs.preferGroupOverChat) {
-            if (group) return { templateId: group, source: SETTING_SOURCES.GROUP };
-            if (chat) return { templateId: chat, source: `${SETTING_SOURCES.GROUP_CHAT} (fallback)` };
-            if (primaryLock) return { templateId: primaryLock, source: `${primarySource} (fallback)` };
-        } else {
-            if (chat) return { templateId: chat, source: SETTING_SOURCES.GROUP_CHAT };
-            if (group) return { templateId: group, source: `${SETTING_SOURCES.GROUP} (fallback)` };
-            if (primaryLock) return { templateId: primaryLock, source: `${primarySource} (fallback)` };
-        }
-
-        return { templateId: null, source: 'none' };
-    }
-
-    _resolveSingleLocks(context, locks) {
-        const prefs = this.extensionSettings;
-        const { character, model, chat } = locks;
-
-        // Determine primary lock based on lockingMode
-        const lockingMode = prefs.lockingMode || LOCKING_MODES.MODEL;
-        const primaryLock = lockingMode === LOCKING_MODES.MODEL ? model : character;
-        const primarySource = lockingMode === LOCKING_MODES.MODEL ? 'model' : 'character';
-
-        // Use user-defined priority for single chats
-        if (prefs.preferCharacterOverChat) {
-            if (primaryLock) return { templateId: primaryLock, source: primarySource };
-            if (chat) return { templateId: chat, source: `${SETTING_SOURCES.CHAT} (fallback)` };
-        } else {
-            if (chat) return { templateId: chat, source: SETTING_SOURCES.CHAT };
-            if (primaryLock) return { templateId: primaryLock, source: `${primarySource} (fallback)` };
-        }
-
-        return { templateId: null, source: 'none' };
-    }
-}
-
-/**
- * Main template lock manager
- */
-class TemplateLockManager {
-    constructor(storage) {
-        this.storage = storage;
-        this.lockResolver = new TemplateLockResolver(storage.getExtensionSettings());
-        this.chatContext = new ChatContext();
-        this.currentLocks = this._getEmptyLocks();
-    }
-
-    _getEmptyLocks() {
-        return {
-            character: null,
-            model: null,
-            chat: null,
-            group: null
-        };
-    }
-
-    async loadCurrentLocks() {
-        const context = this.chatContext.getCurrent();
-        this.currentLocks = this._getEmptyLocks();
-
-        if (context.isGroupChat) {
-            this._loadGroupLocks(context);
-        } else {
-            this._loadSingleLocks(context);
-        }
-
-        return this.currentLocks;
-    }
-
-    _loadGroupLocks(context) {
-        if (context.groupId) {
-            this.currentLocks.group = this.storage.getGroupTemplateLock(context.groupId);
-            this.currentLocks.chat = this.storage.getGroupChatTemplateLock(context.groupId);
-        }
-
-        // Load character lock for the primary character in the group
-        if (context.characterName) {
-            const chId = characters?.findIndex(x => x.name === context.characterName);
-            const characterKey = chId !== -1 ? chId : context.characterName;
-            this.currentLocks.character = this.storage.getCharacterTemplateLock(characterKey);
-        }
-
-        // Load model lock
-        if (context.modelName) {
-            this.currentLocks.model = this.storage.getModelTemplateLock(context.modelName);
-        }
-    }
-
-    _loadSingleLocks(context) {
-        // Load character lock
-        if (context.characterName) {
-            const chId = characters?.findIndex(x => x.name === context.characterName);
-            const characterKey = chId !== -1 ? chId : context.characterName;
-            this.currentLocks.character = this.storage.getCharacterTemplateLock(characterKey);
-        }
-
-        // Load model lock
-        if (context.modelName) {
-            this.currentLocks.model = this.storage.getModelTemplateLock(context.modelName);
-        }
-
-        // Load chat lock
-        if (context.chatId) {
-            this.currentLocks.chat = this.storage.getChatTemplateLock();
-        }
-    }
-
-    async getLockToApply() {
-        const context = this.chatContext.getCurrent();
-        // Pass extension settings to resolver for priority preferences
-        const settings = this.storage.getExtensionSettings();
-        this.lockResolver = new TemplateLockResolver(settings);
-        return this.lockResolver.resolve(context, this.currentLocks);
-    }
-
-    async setLock(target, templateId) {
-        const context = this.chatContext.getCurrent();
-        let success = false;
-
-        switch (target) {
-            case 'character':
-                if (context.characterName) {
-                    const chId = characters?.findIndex(x => x.name === context.characterName);
-                    const characterKey = chId !== -1 ? chId : context.characterName;
-                    success = this.storage.setCharacterTemplateLock(characterKey, templateId);
-                    if (success) this.currentLocks.character = templateId;
-                }
-                break;
-            case 'model':
-                if (context.modelName) {
-                    success = this.storage.setModelTemplateLock(context.modelName, templateId);
-                    if (success) this.currentLocks.model = templateId;
-                }
-                break;
-            case 'chat':
-                if (context.isGroupChat) {
-                    success = await this.storage.setGroupChatTemplateLock(context.groupId, templateId);
-                } else {
-                    success = this.storage.setChatTemplateLock(templateId);
-                }
-                if (success) this.currentLocks.chat = templateId;
-                break;
-            case 'group':
-                if (context.isGroupChat && context.groupId) {
-                    success = await this.storage.setGroupTemplateLock(context.groupId, templateId);
-                    if (success) this.currentLocks.group = templateId;
-                }
-                break;
-        }
-
-        return success;
-    }
-
-    async clearLock(target) {
-        const context = this.chatContext.getCurrent();
-        let success = false;
-
-        switch (target) {
-            case 'character':
-                if (context.characterName) {
-                    const chId = characters?.findIndex(x => x.name === context.characterName);
-                    const characterKey = chId !== -1 ? chId : context.characterName;
-                    success = this.storage.deleteCharacterTemplateLock(characterKey);
-                    if (success) this.currentLocks.character = null;
-                }
-                break;
-            case 'model':
-                if (context.modelName) {
-                    success = this.storage.deleteModelTemplateLock(context.modelName);
-                    if (success) this.currentLocks.model = null;
-                }
-                break;
-            case 'chat':
-                if (context.isGroupChat) {
-                    success = await this.storage.deleteGroupChatTemplateLock(context.groupId);
-                } else {
-                    success = this.storage.deleteChatTemplateLock();
-                }
-                if (success) this.currentLocks.chat = null;
-                break;
-            case 'group':
-                if (context.isGroupChat && context.groupId) {
-                    success = await this.storage.deleteGroupTemplateLock(context.groupId);
-                    if (success) this.currentLocks.group = null;
-                }
-                break;
-        }
-
-        return success;
-    }
-
-    onContextChanged() {
-        this.chatContext.invalidate();
-        this.loadCurrentLocks();
-    }
-}
-
-// PromptTemplate: Represents a reusable prompt template
-class PromptTemplate {
-	/**
-	 * @param {Object} param0
-	 * @param {string} param0.name - Name of the template
-	 * @param {string} param0.description - Description of the template
-	 * @param {Object} param0.prompts - SillyTavern prompt configuration object
-	 * @param {Array} [param0.promptOrder] - Order of prompts
-	 * @param {string} [param0.characterName] - Name of character this template was created for
-	 * @param {string} [param0.id] - Optional unique identifier
-	 */
-	constructor({ name, description, prompts, promptOrder, characterName, id }) {
-		this.id = id || PromptTemplate.generateId();
-		this.name = name;
-		this.description = description;
-		// Store ST-compatible prompt structure
-		this.prompts = this.validateAndNormalizePrompts(prompts || {});
-		this.promptOrder = promptOrder || [];
-		this.characterName = characterName || null; // Store for reference/display
-		this.createdAt = new Date().toISOString();
-		this.updatedAt = new Date().toISOString();
+// Initialize extension using new modular architecture
+(function initCCPM() {
+	const defaultSettings = {
+		templates: {},
+		templateLocks: {},
+		lockingMode: LOCKING_MODES.MODEL,
+		autoApplyMode: AUTO_APPLY_MODES.ASK,
+		preferPrimaryOverChat: true,
+		preferGroupOverChat: true,
+		preferIndividualCharacterInGroup: false,
+		version: '1.0.0'
+	};
+
+	if (!extension_settings.ccPromptManager) {
+		extension_settings.ccPromptManager = defaultSettings;
 	}
 
-	/**
-	 * Validate and normalize prompts to SillyTavern format
-	 * @param {Object} prompts - Raw prompt data
-	 * @returns {Object} - Normalized SillyTavern prompt structure
-	 */
-	validateAndNormalizePrompts(prompts) {
-		const normalized = {};
-
-		// Accept all prompts - ST supports many identifiers dynamically
-		// Don't filter by a hardcoded list to avoid data loss
-		for (const [identifier, promptData] of Object.entries(prompts)) {
-			if (identifier && promptData && typeof promptData === 'object') {
-				// Keep all existing properties from ST's prompt structure
-				normalized[identifier] = {
-					identifier: identifier,
-					...promptData  // Preserve all ST prompt properties
-				};
-			}
-		}
-
-		return normalized;
+	// Ensure all settings exist (migrations)
+	if (extension_settings.ccPromptManager.lockingMode === undefined) {
+		extension_settings.ccPromptManager.lockingMode = LOCKING_MODES.MODEL;
+	}
+	if (extension_settings.ccPromptManager.preferPrimaryOverChat === undefined) {
+		extension_settings.ccPromptManager.preferPrimaryOverChat = true;
+	}
+	if (extension_settings.ccPromptManager.preferGroupOverChat === undefined) {
+		extension_settings.ccPromptManager.preferGroupOverChat = true;
+	}
+	if (extension_settings.ccPromptManager.preferIndividualCharacterInGroup === undefined) {
+		extension_settings.ccPromptManager.preferIndividualCharacterInGroup = false;
 	}
 
-	/**
-	 * Get default name for prompt identifier
-	 * @param {string} identifier
-	 * @returns {string}
-	 */
-	getDefaultPromptName(identifier) {
-		const names = {
-			'main': 'Main Prompt',
-			'nsfw': 'NSFW Prompt',
-			'jailbreak': 'Jailbreak Prompt',
-			'impersonation': 'Impersonation Prompt',
-			'utility': 'Utility Prompt'
-		};
-		return names[identifier] || identifier;
+	// Migrate old settings
+	if (extension_settings.ccPromptManager.autoApplyLocked && !extension_settings.ccPromptManager.autoApplyMode) {
+		const oldValue = extension_settings.ccPromptManager.autoApplyLocked;
+		extension_settings.ccPromptManager.autoApplyMode = oldValue === 'auto' ? AUTO_APPLY_MODES.ALWAYS : oldValue === 'ask' ? AUTO_APPLY_MODES.ASK : AUTO_APPLY_MODES.NEVER;
+		delete extension_settings.ccPromptManager.autoApplyLocked;
+	}
+	if (extension_settings.ccPromptManager.preferCharacterOverChat !== undefined && extension_settings.ccPromptManager.preferPrimaryOverChat === undefined) {
+		extension_settings.ccPromptManager.preferPrimaryOverChat = extension_settings.ccPromptManager.preferCharacterOverChat;
+		delete extension_settings.ccPromptManager.preferCharacterOverChat;
 	}
 
-	static generateId() {
-		return 'tmpl_' + Math.random().toString(36).substr(2, 9);
-	}
-
-	update(fields) {
-		// Handle prompt updates specially to maintain validation
-		if (fields.prompts) {
-			this.prompts = this.validateAndNormalizePrompts(fields.prompts);
-			delete fields.prompts;
-		}
-		Object.assign(this, fields);
-		this.updatedAt = new Date().toISOString();
-	}
-}
-
-// PromptTemplateManager: Handles CRUD for prompt templates and template locking
-class PromptTemplateManager {
-	constructor() {
-		/** @type {Map<string, PromptTemplate>} */
-		this.templates = new Map();
-
-		// Initialize locking system
-		this.storage = new TemplateStorageAdapter();
-		this.lockManager = new TemplateLockManager(this.storage);
-
-		this.initializeSettings();
-		this.loadTemplatesFromSettings();
-		this.setupEventHandlers();
-	}
-
-	// Initialize extension settings with defaults
-	initializeSettings() {
-		const defaultSettings = {
-			templates: {},
-			templateLocks: {},
-			lockingMode: LOCKING_MODES.MODEL,  // 'character' or 'model'
-			autoApplyMode: AUTO_APPLY_MODES.ASK,  // 'never', 'ask', or 'always'
-			// Priority preferences for single chat (character/model vs chat)
-			preferCharacterOverChat: true,
-			// Priority preferences for group chat (group vs chat vs character/model)
-			preferGroupOverChat: true,
-			preferIndividualCharacterInGroup: false,
-			version: '1.0.0'
-		};
-
-		if (!extension_settings.ccPromptManager) {
-			extension_settings.ccPromptManager = defaultSettings;
-			// Don't save during initialization - SillyTavern will handle persistence
-		}
-
-		// Ensure all settings exist
-		if (extension_settings.ccPromptManager.lockingMode === undefined) {
-			extension_settings.ccPromptManager.lockingMode = LOCKING_MODES.MODEL;
-		}
-		if (extension_settings.ccPromptManager.preferCharacterOverChat === undefined) {
-			extension_settings.ccPromptManager.preferCharacterOverChat = true;
-		}
-		if (extension_settings.ccPromptManager.preferGroupOverChat === undefined) {
-			extension_settings.ccPromptManager.preferGroupOverChat = true;
-		}
-		if (extension_settings.ccPromptManager.preferIndividualCharacterInGroup === undefined) {
-			extension_settings.ccPromptManager.preferIndividualCharacterInGroup = false;
-		}
-
-		// Migrate old setting if it exists
-		if (extension_settings.ccPromptManager.autoApplyLocked && !extension_settings.ccPromptManager.autoApplyMode) {
-			const oldValue = extension_settings.ccPromptManager.autoApplyLocked;
-			extension_settings.ccPromptManager.autoApplyMode = oldValue === 'auto' ? AUTO_APPLY_MODES.ALWAYS : oldValue === 'ask' ? AUTO_APPLY_MODES.ASK : AUTO_APPLY_MODES.NEVER;
-			delete extension_settings.ccPromptManager.autoApplyLocked;
-		}
-	}
-
-	// Save current state to settings
-	saveSettings() {
-		console.log('CCPM DEBUG: saveSettings called');
-		if (!extension_settings.ccPromptManager) {
-			extension_settings.ccPromptManager = {};
-		}
-
-		const exported = this.exportTemplates();
-		console.log('CCPM DEBUG: Exporting templates, count:', exported.length);
-		extension_settings.ccPromptManager.templates = exported.reduce((acc, template) => {
-			acc[template.id] = template;
-			return acc;
-		}, {});
-
-		console.log('CCPM DEBUG: Templates saved to extension_settings, ids:', Object.keys(extension_settings.ccPromptManager.templates));
-		console.log('CCPM DEBUG: Calling saveSettingsDebounced');
-		saveSettingsDebounced();
-	}
-
-	// Load templates from settings
-	loadTemplatesFromSettings() {
-		console.log('CCPM DEBUG: loadTemplatesFromSettings called');
-		console.log('CCPM DEBUG: extension_settings.ccPromptManager exists?', !!extension_settings.ccPromptManager);
-		if (extension_settings.ccPromptManager?.templates) {
-			console.log('CCPM DEBUG: Found templates in extension_settings, count:', Object.keys(extension_settings.ccPromptManager.templates).length);
-			const templateData = Object.values(extension_settings.ccPromptManager.templates);
-			console.log('CCPM DEBUG: Template data to load:', templateData);
-			// Import without saving (avoid infinite loop with SETTINGS_UPDATED event)
-			for (const data of templateData) {
-				const tmpl = new PromptTemplate(data);
-				console.log('CCPM DEBUG: Loading template:', tmpl.id, tmpl.name);
-				this.templates.set(tmpl.id, tmpl);
-			}
-			console.log('CCPM DEBUG: Templates loaded, this.templates.size:', this.templates.size);
-		} else {
-			console.log('CCPM DEBUG: No templates found in extension_settings');
-		}
-	}
-
-	/**
-	 * Create and store a new prompt template
-	 * @param {Object} data - Template data
-	 * @returns {PromptTemplate}
-	 */
-	createTemplate(data) {
-		console.log('CCPM DEBUG: createTemplate called with data:', data);
-		const tmpl = new PromptTemplate(data);
-		console.log('CCPM DEBUG: PromptTemplate created, id:', tmpl.id, 'name:', tmpl.name);
-		this.templates.set(tmpl.id, tmpl);
-		console.log('CCPM DEBUG: Template added to this.templates Map, size:', this.templates.size);
-		console.log('CCPM DEBUG: Calling saveSettings from createTemplate');
-		this.saveSettings();
-		return tmpl;
-	}
-
-	/**
-	 * Get a template by id
-	 * @param {string} id
-	 * @returns {PromptTemplate|null}
-	 */
-	getTemplate(id) {
-		return this.templates.get(id) || null;
-	}
-
-	/**
-	 * Update a template by id
-	 * @param {string} id
-	 * @param {Object} fields
-	 * @returns {PromptTemplate|null}
-	 */
-	updateTemplate(id, fields) {
-		const tmpl = this.getTemplate(id);
-		if (tmpl) {
-			tmpl.update(fields);
-			this.saveSettings();
-			return tmpl;
-		}
-		return null;
-	}
-
-	/**
-	 * Delete a template by id
-	 * @param {string} id
-	 * @returns {boolean}
-	 */
-	deleteTemplate(id) {
-		const result = this.templates.delete(id);
-		if (result) {
-			this.saveSettings();
-		}
-		return result;
-	}
-
-	/**
-	 * List all templates
-	 * @returns {PromptTemplate[]}
-	 */
-	listTemplates() {
-		return Array.from(this.templates.values());
-	}
-
-	/**
-	 * Import templates from array
-	 * @param {Array<Object>} arr
-	 */
-	importTemplates(arr) {
-		let imported = 0;
-		let skipped = 0;
-
-		for (const data of arr) {
-			// Validate required fields
-			if (!data.name || typeof data.name !== 'string') {
-				console.warn('CCPM: Skipping template - missing or invalid name');
-				skipped++;
-				continue;
-			}
-
-			if (!data.prompts || typeof data.prompts !== 'object' || Object.keys(data.prompts).length === 0) {
-				console.warn('CCPM: Skipping template - missing or empty prompts:', data.name);
-				skipped++;
-				continue;
-			}
-
-			if (!data.promptOrder || !Array.isArray(data.promptOrder) || data.promptOrder.length === 0) {
-				console.warn('CCPM: Skipping template - missing or empty promptOrder:', data.name);
-				skipped++;
-				continue;
-			}
-
-			// Force regenerate ID to prevent XSS from malicious imported templates
-			delete data.id;
-			const tmpl = new PromptTemplate(data);
-			this.templates.set(tmpl.id, tmpl);
-			imported++;
-		}
-
-		if (imported > 0) {
-			this.saveSettings();
-		}
-
-		return { imported, skipped };
-	}
-
-	/**
-	 * Export all templates as array
-	 * @returns {Array<Object>}
-	 */
-	exportTemplates() {
-		return this.listTemplates().map(t => ({
-			id: t.id,
-			name: t.name,
-			description: t.description,
-			prompts: t.prompts,
-			promptOrder: t.promptOrder,
-			characterName: t.characterName,
-			createdAt: t.createdAt,
-			updatedAt: t.updatedAt,
-		}));
-	}
-
-	/**
-	 * Apply a template to SillyTavern's prompt system
-	 * @param {string} templateId
-	 * @returns {Promise<boolean>} Success status
-	 */
-	async applyTemplate(templateId) {
-		const tmpl = this.getTemplate(templateId);
-		if (!tmpl) {
-			toastr.error('Template not found: ' + templateId);
-			return false;
-		}
-
-		console.log('CCPM DEBUG: applyTemplate called for:', tmpl.name, 'id:', templateId);
-		console.log('CCPM DEBUG: Template prompt identifiers:', Object.keys(tmpl.prompts));
-
-		try {
-			if (!promptManager) {
-				toastr.error('PromptManager not available');
-				return false;
-			}
-
-			// Log current state BEFORE applying
-			console.log('CCPM DEBUG: Current oai_settings.prompts identifiers BEFORE:', oai_settings.prompts?.map(p => p.identifier) || 'none');
-
-			// Convert template's prompts object to array format
-			const promptUpdates = Object.values(tmpl.prompts);
-			console.log('CCPM DEBUG: promptUpdates count:', promptUpdates.length);
-			console.log('CCPM DEBUG: promptUpdates identifiers:', promptUpdates.map(p => p.identifier));
-
-			// Replace entire prompts array with template prompts (like preset import)
-			oai_settings.prompts = promptUpdates;
-			console.log('CCPM DEBUG: Replaced oai_settings.prompts array');
-			console.log('CCPM DEBUG: Current oai_settings.prompts identifiers AFTER replacement:', oai_settings.prompts?.map(p => p.identifier) || 'none');
-
-			// Restore prompt order if saved in template
-			if (tmpl.promptOrder && Array.isArray(tmpl.promptOrder) && tmpl.promptOrder.length > 0) {
-				// Use the character_id that was stored when the template was created
-				// This ensures we apply to the same character_id (e.g., 100001) that was captured
-				const targetCharacterId = tmpl.promptOrderCharacterId ?? 100000;
-				console.log('CCPM DEBUG: Applying prompt order for character ID:', targetCharacterId);
-				console.log('CCPM DEBUG: Template order length:', tmpl.promptOrder.length);
-				console.log('CCPM DEBUG: Template order:', JSON.stringify(tmpl.promptOrder, null, 2));
-
-				// Check if character already has an order entry
-				const existingOrderEntry = oai_settings.prompt_order?.find(entry => String(entry.character_id) === String(targetCharacterId));
-
-				if (existingOrderEntry) {
-					// Replace existing order
-					console.log('CCPM DEBUG: Replacing existing order for character', targetCharacterId);
-					existingOrderEntry.order = JSON.parse(JSON.stringify(tmpl.promptOrder));
-				} else {
-					// Add new order entry for this character
-					console.log('CCPM DEBUG: Adding new order entry for character', targetCharacterId);
-					if (!oai_settings.prompt_order) {
-						oai_settings.prompt_order = [];
-					}
-					oai_settings.prompt_order.push({
-						character_id: targetCharacterId,
-						order: JSON.parse(JSON.stringify(tmpl.promptOrder))
-					});
-				}
-
-				// Update promptManager's activeCharacter to match the template
-				if (promptManager && promptManager.activeCharacter) {
-					promptManager.activeCharacter.id = targetCharacterId;
-					console.log('CCPM DEBUG: Updated promptManager.activeCharacter.id to', targetCharacterId);
-				}
-
-				console.log('CCPM: Restored prompt order for character', targetCharacterId, ':', tmpl.promptOrder.length, 'items');
-			} else {
-				console.log('CCPM DEBUG: No promptOrder in template or empty array');
-			}
-
-			// Save settings and trigger update using PromptManager's method
-			// Track this as the last applied template BEFORE render
-			// (so event listeners can pick it up)
-			lastAppliedTemplateId = templateId;
-
-			// Important: Save first, then render (matches ST's pattern)
-			console.log('CCPM DEBUG: Calling promptManager.saveServiceSettings()');
-			await promptManager.saveServiceSettings();
-
-			console.log('CCPM DEBUG: Calling promptManager.render()');
-			await promptManager.render();
-
-			// Inject template name into ST's prompt manager UI after render
-			setTimeout(() => injectTemplateNameIntoPromptManager(), 100);
-
-			toastr.success(`Template "${tmpl.name}" applied`);
-			console.log('CCPM: Template applied successfully:', tmpl.name);
-			return true;
-		} catch (error) {
-			console.error('CCPM: Failed to apply template:', error);
-			toastr.error('Failed to apply template: ' + error.message);
-			return false;
-		}
-	}
-
-	/**
-	 * Create template from current SillyTavern prompts
-	 * @param {string} name - Template name
-	 * @param {string} description - Template description
-	 * @param {Array<string>} [includePrompts] - Specific prompt identifiers to include
-	 * @returns {PromptTemplate}
-	 */
-	createTemplateFromCurrent(name, description, includePrompts = null) {
-		console.log('CCPM DEBUG: createTemplateFromCurrent called');
-		console.log('CCPM DEBUG: name:', name, 'description:', description, 'includePrompts:', includePrompts);
-		const currentPrompts = {};
-		const availablePrompts = oai_settings.prompts || [];
-		console.log('CCPM DEBUG: availablePrompts is array?', Array.isArray(availablePrompts), 'length:', availablePrompts.length);
-
-		// Convert array format to object format keyed by identifier
-		const promptsMap = Array.isArray(availablePrompts)
-			? availablePrompts.reduce((acc, p) => {
-				if (p.identifier) acc[p.identifier] = p;
-				return acc;
-			}, {})
-			: availablePrompts;
-
-		// Include specified prompts or all available prompts
-		const promptsToInclude = includePrompts || Object.keys(promptsMap);
-		console.log('CCPM DEBUG: promptsToInclude:', promptsToInclude);
-
-		for (const identifier of promptsToInclude) {
-			if (promptsMap[identifier]) {
-				currentPrompts[identifier] = { ...promptsMap[identifier] };
-			}
-		}
-
-		console.log('CCPM DEBUG: currentPrompts collected, keys:', Object.keys(currentPrompts));
-
-		// Capture prompt order using ST's PromptManager
-		// Get current context to determine which character's order to capture
-		const context = getContext();
-		const currentCharId = context.characterId;
-		const currentCharName = context.name2 || name2;
-		console.log('CCPM DEBUG: Current character - ID:', currentCharId, 'Name:', currentCharName);
-
-		// Capture the prompt order that's currently active/displayed
-		// Use promptManager.activeCharacter which reflects what's currently shown in the UI
-		let promptOrderToSave = [];
-		let activeCharacterId = null;
-		if (promptManager && promptManager.activeCharacter) {
-			activeCharacterId = promptManager.activeCharacter.id;
-			console.log('CCPM DEBUG: Using promptManager.activeCharacter:', activeCharacterId);
-			console.log('CCPM DEBUG: Available prompt_order entries:', oai_settings.prompt_order?.map(e => ({ char_id: e.character_id, order_length: e.order?.length })));
-
-			promptOrderToSave = promptManager.getPromptOrderForCharacter(promptManager.activeCharacter);
-			console.log('CCPM DEBUG: Retrieved prompt order:', promptOrderToSave.length, 'items');
-			console.log('CCPM DEBUG: Order identifiers:', promptOrderToSave.map(e => e.identifier));
-		} else {
-			console.warn('CCPM: PromptManager or activeCharacter not available, prompt order will not be saved');
-		}
-
-		const result = this.createTemplate({
-			name,
-			description,
-			prompts: currentPrompts,
-			promptOrder: promptOrderToSave,
-			promptOrderCharacterId: activeCharacterId,  // Store which character_id this order is for
-			characterName: currentCharName
-		});
-		console.log('CCPM DEBUG: createTemplate returned:', result);
-		return result;
-	}
-
-	// Set up event handlers
-	setupEventHandlers() {
-		// Listen for settings updates to sync with external changes
-		eventSource.on(event_types.SETTINGS_UPDATED, () => {
-			this.handleSettingsUpdate();
-		});
-
-		// Listen for preset changes to potentially reapply locked templates
-		if (event_types.PRESET_CHANGED) {
-			eventSource.on(event_types.PRESET_CHANGED, () => {
-				this.handlePresetChange();
-			});
-		}
-
-		// Listen for OAI preset changes (model changes) - used in model mode
-		if (event_types.OAI_PRESET_CHANGED_AFTER) {
-			eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, () => {
-				this.handleOaiPresetChange();
-			});
-		}
-
-		// Listen for character changes to potentially auto-apply templates
-		eventSource.on(event_types.CHAT_CHANGED, () => {
-			this.handleChatChange();
-		});
-
-		// Listen for extension settings loaded
-		eventSource.on(event_types.EXTENSION_SETTINGS_LOADED, () => {
-			this.handleExtensionSettingsLoaded();
-		});
-
-		// Listen for app ready to ensure proper initialization
-		eventSource.on(event_types.APP_READY, () => {
-			this.handleAppReady();
-		});
-
-		// Initialize extension when SillyTavern is ready
-		eventSource.on(event_types.APP_READY, initializeExtension);
-
-		// Additional event handlers from SillyTavern-CharacterLocks
-		// Listen for group chat creation
-		eventSource.on(event_types.GROUP_CHAT_CREATED, () => {
-			this.handleGroupChatCreated();
-		});
-
-		// Listen for group member drafted (useful for group template management)
-		eventSource.on(event_types.GROUP_MEMBER_DRAFTED, (chId) => {
-			this.handleGroupMemberDrafted(chId);
-		});
-
-		// Listen for settings loaded after (more reliable than EXTENSION_SETTINGS_LOADED)
-		if (event_types.SETTINGS_LOADED_AFTER) {
-			eventSource.on(event_types.SETTINGS_LOADED_AFTER, () => {
-				this.handleSettingsLoadedAfter();
-			});
-		}
-
-		// Listen for character message rendered (useful for template context)
-		if (event_types.CHARACTER_MESSAGE_RENDERED) {
-			eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, () => {
-				this.handleCharacterMessageRendered();
-			});
-		}
-
-		// Listen for generation started (useful for template context tracking)
-		if (event_types.GENERATION_STARTED) {
-			eventSource.on(event_types.GENERATION_STARTED, () => {
-				this.handleGenerationStarted();
-			});
-		}
-
-		// Listen for generation ended
-		if (event_types.GENERATION_ENDED) {
-			eventSource.on(event_types.GENERATION_ENDED, () => {
-				this.handleGenerationEnded();
-			});
-		}
-
-		// Inject template name into ST's prompt manager UI whenever it updates
-		const injectTemplateNameDebounced = debounce(injectTemplateNameIntoPromptManager, 500);
-		eventSource.on(event_types.CHAT_CHANGED, injectTemplateNameDebounced);
-		eventSource.on(event_types.SETTINGS_UPDATED, injectTemplateNameDebounced);
-		if (event_types.CHATCOMPLETION_MODEL_CHANGED) {
-			eventSource.on(event_types.CHATCOMPLETION_MODEL_CHANGED, injectTemplateNameDebounced);
-		}
-		if (event_types.OAI_PRESET_CHANGED_AFTER) {
-			eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, injectTemplateNameDebounced);
-		}
-	}
-
-	// Handle settings update event
-	async handleSettingsUpdate() {
-		// Reload templates if extension settings changed externally
-		if (extension_settings.ccPromptManager) {
-			this.loadTemplatesFromSettings();
-		}
-	}
-
-	async handlePresetChange() {
-		const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
-
-		if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
-			console.log('CCPM: Auto-apply disabled, skipping template reapplication');
-			return;
-		}
-
-		const effectiveLock = await this.getEffectiveLock();
-		if (!effectiveLock || !effectiveLock.templateId) {
-			console.log('CCPM: No locked template, skipping auto-apply');
-			return;
-		}
-
-		if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
-			const context = this.lockManager.chatContext.getCurrent();
-			const template = this.getTemplate(effectiveLock.templateId);
-			if (!template) return;
-
-			const contextType = context.isGroupChat ? 'group chat' : 'character';
-			const sourceName = context.isGroupChat ?
-				(context.groupName || 'Unnamed Group') :
-				(context.characterName || 'Unknown Character');
-
-			const popup = new Popup(`
-				<div class="flex-container flexFlowColumn flexGap10">
-					<h4>Preset Changed</h4>
-					<p>Reapply locked template "<strong>${escapeHtml(template.name)}</strong>" for ${contextType} "${escapeHtml(sourceName)}"?</p>
-					<p class="text_muted fontsize90p">This will restore the locked prompt configuration.</p>
-				</div>
-			`, POPUP_TYPE.CONFIRM, '', {
-				okButton: 'Apply',
-				cancelButton: 'Skip',
-				allowVerticalScrolling: true
-			});
-
-			const result = await popup.show();
-			if (result === POPUP_RESULT.AFFIRMATIVE) {
-				await this.applyTemplate(effectiveLock.templateId);
-				toastr.success(`Reapplied template: ${template.name}`);
-			}
-		} else if (autoApplyMode === AUTO_APPLY_MODES.ALWAYS) {
-			const template = this.getTemplate(effectiveLock.templateId);
-			if (template) {
-				await this.applyTemplate(effectiveLock.templateId);
-				toastr.info(`Auto-reapplied template: ${template.name}`);
-			}
-		}
-	}
-
-	/**
-	 * Handle OAI preset change event (model changes) - used in model mode
-	 */
-	async handleOaiPresetChange() {
-		const lockingMode = extension_settings.ccPromptManager?.lockingMode || LOCKING_MODES.MODEL;
-
-		// Only handle this event in model mode
-		if (lockingMode !== LOCKING_MODES.MODEL) {
-			return;
-		}
-
-		console.log('CCPM: OAI preset changed, invalidating context and checking for model locks');
-
-		// Invalidate context cache to pick up new model name
-		this.lockManager.chatContext.invalidate();
-
-		// Reuse the existing preset change logic
-		await this.handlePresetChange();
-	}
-
-	/**
-	 * Handle chat change event
-	 */
-	async handleChatChange() {
-		console.log('CCPM: Chat changed, templates available:', this.templates.size);
-
-		// Invalidate context cache
-		this.lockManager.chatContext.invalidate();
-
-		// Load current locks
-		await this.lockManager.loadCurrentLocks();
-
-		// Apply locked template based on auto-apply mode
-		const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
-
-		if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
-			console.log('CCPM: Auto-apply disabled on chat change');
-			return;
-		}
-
-		const effectiveLock = await this.getEffectiveLock();
-		if (!effectiveLock || !effectiveLock.templateId) {
-			console.log('CCPM: No locked template for this chat');
-			return;
-		}
-
-		const template = this.getTemplate(effectiveLock.templateId);
-		if (!template) {
-			console.warn('CCPM: Locked template not found:', effectiveLock.templateId);
-			return;
-		}
-
-		if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
-			const context = this.lockManager.chatContext.getCurrent();
-			const contextType = context.isGroupChat ? 'group chat' : 'character';
-			const sourceName = context.isGroupChat ?
-				(context.groupName || 'Unnamed Group') :
-				(context.characterName || 'Unknown Character');
-
-			const popup = new Popup(`
-				<div class="flex-container flexFlowColumn flexGap10">
-					<h4>Chat Changed</h4>
-					<p>Apply locked template "<strong>${escapeHtml(template.name)}</strong>" for ${contextType} "${escapeHtml(sourceName)}"?</p>
-					<p class="text_muted fontsize90p">Source: ${effectiveLock.source}</p>
-				</div>
-			`, POPUP_TYPE.CONFIRM, '', {
-				okButton: 'Apply',
-				cancelButton: 'Skip',
-				allowVerticalScrolling: true
-			});
-
-			const result = await popup.show();
-			if (result === POPUP_RESULT.AFFIRMATIVE) {
-				await this.applyTemplate(effectiveLock.templateId);
-				toastr.success(`Applied template: ${template.name}`);
-			}
-		} else if (autoApplyMode === AUTO_APPLY_MODES.ALWAYS) {
-			await this.applyTemplate(effectiveLock.templateId);
-			toastr.info(`Auto-applied template: ${template.name}`);
-		}
-	}
-
-	/**
-	 * Handle extension settings loaded event
-	 */
-	handleExtensionSettingsLoaded() {
-		this.loadTemplatesFromSettings();
-		console.log('CCPM: Extension settings loaded, templates:', this.templates.size);
-	}
-
-	/**
-	 * Handle app ready event
-	 */
-	handleAppReady() {
-		// Ensure UI is injected after app is fully ready
-		this.ensureUIInjected();
-		console.log('CCPM: App ready, extension initialized');
-	}
-
-	/**
-	 * Handle group chat creation event
-	 */
-	handleGroupChatCreated() {
-		// Could implement group-specific template logic
-		console.log('CCPM: Group chat created, templates available:', this.templates.size);
-	}
-
-	/**
-	 * Handle group member drafted event
-	 * @param {number} chId - Character ID that was drafted
-	 */
-	handleGroupMemberDrafted(chId) {
-		// Could implement character-specific template application in groups
-		console.log('CCPM: Group member drafted, chId:', chId);
-		// Future: Apply character-specific templates when generating for that character
-	}
-
-	/**
-	 * Handle settings loaded after event (more reliable initialization)
-	 */
-	handleSettingsLoadedAfter() {
-		this.loadTemplatesFromSettings();
-		this.ensureUIInjected();
-		console.log('CCPM: Settings loaded after, templates:', this.templates.size);
-	}
-
-	/**
-	 * Handle character message rendered event
-	 */
-	handleCharacterMessageRendered() {
-		// Could implement context-aware template suggestions
-		console.log('CCPM: Character message rendered');
-	}
-
-	/**
-	 * Handle generation started event
-	 */
-	handleGenerationStarted() {
-		// Could implement pre-generation template checks
-		console.log('CCPM: Generation started');
-	}
-
-	/**
-	 * Handle generation ended event
-	 */
-	handleGenerationEnded() {
-		// Could implement post-generation template analysis
-		console.log('CCPM: Generation ended');
-	}
-
-	/**
-	 * Ensure UI button is injected
-	 */
-	ensureUIInjected() {
-		if (!document.getElementById('ccpm-prompt-template-btn')) {
-			injectPromptTemplateManagerButton();
-		}
-	}
-
-	// ===== TEMPLATE LOCKING METHODS =====
-
-	/**
-	 * Apply the template that is locked for current context
-	 * @returns {boolean} Success status
-	 */
-	async applyLockedTemplate() {
-		try {
-			const lockResult = await this.lockManager.getLockToApply();
-			if (lockResult.templateId) {
-				console.log(`CCPM: Applying locked template from ${lockResult.source}:`, lockResult.templateId);
-				return await this.applyTemplate(lockResult.templateId);
-			}
-			return false;
-		} catch (error) {
-			toastr.error('CCPM: Error applying locked template:', error);
-			return false;
-		}
-	}
-
-	/**
-	 * Ask user whether to apply the locked template for current context
-	 * @returns {boolean} Success status
-	 */
-	async askToApplyLockedTemplate() {
-		try {
-			const lockResult = await this.lockManager.getLockToApply();
-			if (!lockResult.templateId) {
-				return false;
-			}
-
-			const template = this.getTemplate(lockResult.templateId);
-			if (!template) {
-				console.warn('CCPM: Locked template not found:', lockResult.templateId);
-				return false;
-			}
-
-			const content = document.createElement('div');
-			content.innerHTML = `
-				<div class="flex-container flexFlowColumn flexGap10">
-					<h4>Apply Locked Template?</h4>
-					<p>A template is locked for this ${lockResult.source}:</p>
-					<div class="text_pole padding10">
-						<strong>${escapeHtml(template.name)}</strong>
-						${template.description ? `<br><small class="text_muted">${escapeHtml(template.description)}</small>` : ''}
-					</div>
-					<p>Would you like to apply this template now?</p>
-				</div>
-			`;
-
-			const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
-				okButton: 'Apply',
-				cancelButton: 'Skip',
-				allowVerticalScrolling: true
-			});
-
-			const result = await popup.show();
-			if (result) {
-				console.log(`CCPM: User chose to apply locked template from ${lockResult.source}:`, lockResult.templateId);
-				const success = await this.applyTemplate(lockResult.templateId);
-				if (success) {
-					toastr.success(`Applied template: ${template.name}`, 'CCPM');
-				}
-				return success;
-			} else {
-				console.log('CCPM: User chose to skip applying locked template');
-				return false;
-			}
-		} catch (error) {
-			toastr.error('CCPM: Error asking to apply locked template:', error);
-			return false;
-		}
-	}
-
-	/**
-	 * Lock a template to a specific target (character, chat, or group)
-	 * @param {string} templateId - Template to lock
-	 * @param {string} target - Lock target: 'character', 'chat', or 'group'
-	 * @returns {boolean} Success status
-	 */
-	async lockTemplate(templateId, target) {
-		const template = this.getTemplate(templateId);
-		if (!template) {
-			toastr.error('CCPM: Cannot lock template - template not found:', templateId);
-			return false;
-		}
-
-		const success = await this.lockManager.setLock(target, templateId);
-		if (success) {
-			console.log(`CCPM: Locked template "${template.name}" to ${target}`);
-			toastr.success(`Template locked to ${target}`, 'CCPM');
-		} else {
-			toastr.error(`CCPM: Failed to lock template to ${target}`);
-			toastr.error(`Failed to lock template to ${target}`, 'CCPM');
-		}
-		return success;
-	}
-
-	/**
-	 * Clear template lock for a specific target
-	 * @param {string} target - Lock target: 'character', 'chat', or 'group'
-	 * @returns {boolean} Success status
-	 */
-	async clearTemplateLock(target) {
-		const success = await this.lockManager.clearLock(target);
-		if (success) {
-			console.log(`CCPM: Cleared ${target} template lock`);
-			toastr.success(`${target} template lock cleared`, 'CCPM');
-		} else {
-			console.log(`CCPM: No ${target} template lock to clear`);
-		}
-		return success;
-	}
-
-	/**
-	 * Get the currently locked template for each target
-	 * @returns {Object} Current locks
-	 */
-	async getCurrentLocks() {
-		await this.lockManager.loadCurrentLocks();
-		return this.lockManager.currentLocks;
-	}
-
-	/**
-	 * Get the template that would be applied based on current context
-	 * @returns {Object|null} Lock result with templateId and source
-	 */
-	async getEffectiveLock() {
-		await this.lockManager.loadCurrentLocks();
-		return this.lockManager.getLockToApply();
-	}
-
-	/**
-	 * Cleanup event handlers (for extension unload)
-	 */
-	cleanup() {
-		// Core event handlers
-		eventSource.off(event_types.SETTINGS_UPDATED, this.handleSettingsUpdate);
-		eventSource.off(event_types.CHAT_CHANGED, this.handleChatChange);
-		eventSource.off(event_types.EXTENSION_SETTINGS_LOADED, this.handleExtensionSettingsLoaded);
-		eventSource.off(event_types.APP_READY, this.handleAppReady);
-
-		if (event_types.OAI_PRESET_CHANGED_AFTER) {
-			eventSource.off(event_types.OAI_PRESET_CHANGED_AFTER, this.handleOaiPresetChange);
-		}
-
-		// Additional event handlers from SillyTavern-CharacterLocks
-		eventSource.off(event_types.GROUP_CHAT_CREATED, this.handleGroupChatCreated);
-		eventSource.off(event_types.GROUP_MEMBER_DRAFTED, this.handleGroupMemberDrafted);
-
-		if (event_types.SETTINGS_LOADED_AFTER) {
-			eventSource.off(event_types.SETTINGS_LOADED_AFTER, this.handleSettingsLoadedAfter);
-		}
-
-		if (event_types.CHARACTER_MESSAGE_RENDERED) {
-			eventSource.off(event_types.CHARACTER_MESSAGE_RENDERED, this.handleCharacterMessageRendered);
-		}
-
-		if (event_types.GENERATION_STARTED) {
-			eventSource.off(event_types.GENERATION_STARTED, this.handleGenerationStarted);
-		}
-
-		if (event_types.GENERATION_ENDED) {
-			eventSource.off(event_types.GENERATION_ENDED, this.handleGenerationEnded);
-		}
-	}
-}
-
-// Example: create a global instance (optional)
-export const promptTemplateManager = new PromptTemplateManager();
+	console.log('CCPM: Modular architecture initialized');
+})();
 
 // Expose for debugging
-window.ccpmTemplateManager = promptTemplateManager;
+// window.ccpmTemplateManager = promptTemplateManager;
 window.ccpmInjectTemplateName = injectTemplateNameIntoPromptManager;
+window.ccpmNewHandlers = NewEventHandlers;
 // --- CCPM Prompt Template Manager UI Injection ---
 function injectPromptTemplateManagerButton() {
 	// Wait for DOM ready and #extensionsMenuButton to exist
@@ -1844,8 +1558,6 @@ async function renderPromptTemplateList() {
 	}).join('');
 }
 
-// escapeHtml is now imported from ST's utils.js
-
 function setupTemplateManagerEvents() {
 	// Setup toolbar events
 	document.getElementById('ccpm-create-from-current')?.addEventListener('click', () => {
@@ -1868,6 +1580,9 @@ let ccpmMainPopup = null;
 window.ccpmApplyTemplate = async function(id) {
 	if (await promptTemplateManager.applyTemplate(id)) {
 		toastr.success('Template applied successfully!');
+		// Update display to show applied template
+		const effectiveLock = await promptTemplateManager.getEffectiveLock();
+		injectTemplateNameIntoPromptManager(id, effectiveLock);
 		// Close the main popup properly using complete() to trigger proper cleanup
 		if (ccpmMainPopup) {
 			await ccpmMainPopup.completeAffirmative();
@@ -1951,7 +1666,7 @@ window.ccpmShowLockMenu = async function(templateId) {
 	}
 
 	const autoApplyMode = extension_settings.ccPromptManager?.autoApplyMode || AUTO_APPLY_MODES.ASK;
-	const preferCharacterOverChat = extension_settings.ccPromptManager?.preferCharacterOverChat ?? true;
+	const preferPrimaryOverChat = extension_settings.ccPromptManager?.preferPrimaryOverChat ?? true;
 	const preferGroupOverChat = extension_settings.ccPromptManager?.preferGroupOverChat ?? true;
 	const preferIndividualCharacterInGroup = extension_settings.ccPromptManager?.preferIndividualCharacterInGroup ?? false;
 
@@ -2035,8 +1750,8 @@ window.ccpmShowLockMenu = async function(templateId) {
 				` : `
 					<div class="marginTop10">
 						<label class="checkbox_label">
-							<input type="checkbox" id="ccpm-pref-char-over-chat" ${preferCharacterOverChat ? 'checked' : ''} onchange="window.ccpmSetPriority('preferCharacterOverChat', this.checked)">
-							<span>Prefer ${primaryLabel.toLowerCase()} settings over chat</span>
+							<input type="checkbox" id="ccpm-pref-primary-over-chat" ${preferPrimaryOverChat ? 'checked' : ''} onchange="window.ccpmSetPriority('preferPrimaryOverChat', this.checked)">
+							<span>Prefer ${primaryLabel.toLowerCase()} over chat</span>
 						</label>
 					</div>
 				`}
@@ -2079,7 +1794,7 @@ window.ccpmLockToTarget = async function(templateId, target) {
 		// Just refresh the template list in the main popup
 		await renderPromptTemplateList();
 		// Update the template name display in ST's prompt manager
-		setTimeout(() => injectTemplateNameIntoPromptManager(), 100);
+		injectTemplateNameIntoPromptManager();
 	}
 };
 
@@ -2090,7 +1805,7 @@ window.ccpmClearLock = async function(target) {
 		// Just refresh the template list in the main popup
 		await renderPromptTemplateList();
 		// Update the template name display in ST's prompt manager
-		setTimeout(() => injectTemplateNameIntoPromptManager(), 100);
+		injectTemplateNameIntoPromptManager();
 	}
 };
 
@@ -2637,7 +2352,15 @@ function exportAllTemplates() {
 
 // Extension initialization - wait for SillyTavern to be ready
 function initializeExtension() {
-	// Extension is ready, manager will handle UI injection via events
+	// Inject UI when app is ready
+	injectPromptTemplateManagerButton();
 	console.log('CCPM: Extension initialized');
+}
+
+// Register event handlers using new modular architecture
+eventSource.on(event_types.APP_READY, initializeExtension);
+eventSource.on(event_types.CHAT_CHANGED, () => NewEventHandlers.onChatChanged());
+if (event_types.OAI_PRESET_CHANGED_AFTER) {
+	eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, () => NewEventHandlers.onPresetChanged());
 }
 
