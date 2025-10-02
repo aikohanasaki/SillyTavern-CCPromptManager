@@ -5,9 +5,7 @@ import { power_user } from '../../../power-user.js';
 import { oai_settings, promptManager } from '../../../openai.js';
 import { selected_group, groups, editGroup } from '../../../group-chats.js';
 import { escapeHtml, debounce } from '../../../utils.js';
-
-const MODULE_NAME = 'CCPM';
-const CACHE_TTL = 1000;
+import { executeSlashCommands } from '../../../slash-commands.js';
 
 const CHAT_TYPES = {
     SINGLE: 'single',
@@ -16,6 +14,7 @@ const CHAT_TYPES = {
 
 const SETTING_SOURCES = {
     CHARACTER: 'character',
+    MODEL: 'model',
     CHAT: 'chat',
     GROUP: 'group',
     GROUP_CHAT: 'group chat'
@@ -451,15 +450,15 @@ const Storage = {
 /**
  * Resolve current chat context
  * Pure function - no caching (premature optimization removed)
- * @returns {Object} Context object
+ * @returns {Promise<Object>} Context object
  */
-function resolveContext() {
+async function resolveContext() {
 	const isGroupChat = !!selected_group;
 
 	if (isGroupChat) {
 		const groupId = selected_group;
 		const group = groups?.find(g => g.id === groupId);
-		const modelName = _getModelName();
+		const modelName = await _getModelName();
 
 		return {
 			type: CHAT_TYPES.GROUP,
@@ -477,7 +476,7 @@ function resolveContext() {
 
 	// Single chat
 	const characterName = _getCharacterName();
-	const modelName = _getModelName();
+	const modelName = await _getModelName();
 	const chatId = _getChatId();
 
 	return {
@@ -532,14 +531,14 @@ function _getChatId() {
 }
 
 /**
- * Get current model name
+ * Get current model name using ST's /model slash command
  * @private
+ * @returns {Promise<string|null>}
  */
-function _getModelName() {
+async function _getModelName() {
 	try {
-		// Use ST's /model slash command
-		const modelName = window.executeSlashCommandsOnChatInput?.('/model') || null;
-		return modelName;
+		const result = await executeSlashCommands('/model');
+		return result?.pipe || null;
 	} catch (error) {
 		console.warn('CCPM: Error getting model name:', error);
 		return null;
@@ -743,23 +742,31 @@ async function applyTemplate(templateId) {
  * @param {Object|null} lockInfo - Lock info from resolveLock() {templateId, source}
  */
 function updateDisplay(appliedTemplateId = null, lockInfo = null) {
+	console.log('CCPM DEBUG: updateDisplay called', { appliedTemplateId, lockInfo });
+	console.log('CCPM DEBUG: Is promptManager.render still hooked?', promptManager?.render?.name === 'renderHook' || promptManager?.render?.toString().includes('CCPM DEBUG'));
 	const promptList = document.getElementById('completion_prompt_manager_list');
+	console.log('CCPM DEBUG: promptList found?', !!promptList);
 	if (!promptList) return;
 
 	// Remove existing indicator
 	const existing = document.getElementById('ccpm-template-indicator');
-	if (existing) existing.remove();
+	if (existing) {
+		console.log('CCPM DEBUG: Removing existing indicator');
+		existing.remove();
+	}
 
 	// Build display HTML
 	const html = _buildDisplayHtml(appliedTemplateId, lockInfo);
+	console.log('CCPM DEBUG: Built HTML:', html);
 	if (!html) return; // Nothing to display
 
 	// Create and insert indicator
 	const indicator = document.createElement('div');
 	indicator.id = 'ccpm-template-indicator';
-	indicator.className = 'ccpm-template-status';
+	indicator.className = 'ccpm-template-indicator';
 	indicator.innerHTML = `<small class="text_muted">${html}</small>`;
 	promptList.insertAdjacentElement('beforebegin', indicator);
+	console.log('CCPM DEBUG: Display box inserted');
 }
 
 /**
@@ -812,8 +819,8 @@ function _buildDisplayHtml(appliedId, lock) {
 		`;
 	}
 
-	// Nothing to display
-	return null;
+	// Nothing locked or applied - show default message
+	return '<span class="fa-solid fa-circle-info"></span> No prompt template applied, using preset default';
 }
 
 // ============================================================================
@@ -828,7 +835,7 @@ function _buildDisplayHtml(appliedId, lock) {
 async function handleAutoApply(reason = 'chat') {
 	console.log('CCPM NEW: handleAutoApply called, reason:', reason);
 
-	const context = resolveContext();
+	const context = await resolveContext();
 	console.log('CCPM NEW: context:', context);
 
 	const preferences = Storage.getPreferences();
@@ -963,8 +970,8 @@ const NewEventHandlers = {
 	 * Handle SETTINGS_UPDATED event
 	 * Just refresh display, don't auto-apply
 	 */
-	onSettingsUpdated() {
-		const context = resolveContext();
+	async onSettingsUpdated() {
+		const context = await resolveContext();
 		const preferences = Storage.getPreferences();
 		const lock = resolveLock(context, preferences);
 
@@ -984,7 +991,7 @@ const NewEventHandlers = {
 			toastr.success(`Template applied: ${template.name}`);
 
 			// Update display
-			const context = resolveContext();
+			const context = await resolveContext();
 			const preferences = Storage.getPreferences();
 			const lock = resolveLock(context, preferences);
 			updateDisplay(templateId, lock);
@@ -1026,7 +1033,7 @@ const NewEventHandlers = {
 	 * @param {string} target - 'character', 'model', 'chat', 'group'
 	 */
 	async setLock(templateId, target) {
-		const context = resolveContext();
+		const context = await resolveContext();
 		const preferences = Storage.getPreferences();
 
 		switch (target) {
@@ -1060,7 +1067,7 @@ const NewEventHandlers = {
 	 * @param {string} target - 'character', 'model', 'chat', 'group'
 	 */
 	async clearLock(target) {
-		const context = resolveContext();
+		const context = await resolveContext();
 		const preferences = Storage.getPreferences();
 
 		switch (target) {
@@ -1122,10 +1129,10 @@ const UIHelpers = {
 
 	/**
 	 * Get current locks for all targets
-	 * @returns {Object} {character, model, chat, group}
+	 * @returns {Promise<Object>} {character, model, chat, group}
 	 */
 	async getCurrentLocks() {
-		const context = resolveContext();
+		const context = await resolveContext();
 		return {
 			character: Storage.getCharacterLock(context.characterName),
 			model: Storage.getModelLock(context.modelName),
@@ -1136,10 +1143,10 @@ const UIHelpers = {
 
 	/**
 	 * Get effective lock (which lock applies based on priority)
-	 * @returns {Object|null} {templateId, source} or null
+	 * @returns {Promise<Object|null>} {templateId, source} or null
 	 */
 	async getEffectiveLock() {
-		const context = resolveContext();
+		const context = await resolveContext();
 		const preferences = Storage.getPreferences();
 		const lock = resolveLock(context, preferences);
 		return lock || { templateId: null, source: null };
@@ -1255,8 +1262,8 @@ const UIHelpers = {
 	 */
 	lockManager: {
 		chatContext: {
-			getCurrent() {
-				return resolveContext();
+			async getCurrent() {
+				return await resolveContext();
 			},
 			invalidate() {
 				// New architecture doesn't cache, so this is a no-op
@@ -1367,6 +1374,12 @@ function injectTemplateNameIntoPromptManager(appliedTemplateId = null, effective
 	}
 
 	// Ensure all settings exist (migrations)
+	if (!extension_settings.ccPromptManager.templates) {
+		extension_settings.ccPromptManager.templates = {};
+	}
+	if (!extension_settings.ccPromptManager.templateLocks) {
+		extension_settings.ccPromptManager.templateLocks = {};
+	}
 	if (extension_settings.ccPromptManager.lockingMode === undefined) {
 		extension_settings.ccPromptManager.lockingMode = LOCKING_MODES.MODEL;
 	}
@@ -1643,7 +1656,7 @@ window.ccpmShowLockMenu = async function(templateId) {
 	}
 
 	const currentLocks = await promptTemplateManager.getCurrentLocks();
-	const context = promptTemplateManager.lockManager.chatContext.getCurrent();
+	const context = await promptTemplateManager.lockManager.chatContext.getCurrent();
 
 	// Determine locking mode and available targets
 	const lockingMode = extension_settings.ccPromptManager?.lockingMode || LOCKING_MODES.MODEL;
@@ -2352,14 +2365,43 @@ function exportAllTemplates() {
 
 // Extension initialization - wait for SillyTavern to be ready
 function initializeExtension() {
+	console.log('CCPM: initializeExtension called');
+	console.log('CCPM: promptManager exists?', !!promptManager);
+
 	// Inject UI when app is ready
 	injectPromptTemplateManagerButton();
+
+	// Hook into promptManager.renderPromptManagerListItems() to inject display box
+	// This way our display is part of the rendered content, not inserted afterward
+	if (promptManager) {
+		console.log('CCPM: Hooking into promptManager.renderPromptManagerListItems()');
+
+		const originalRenderListItems = promptManager.renderPromptManagerListItems.bind(promptManager);
+
+		promptManager.renderPromptManagerListItems = async function(...args) {
+			console.log('CCPM DEBUG: renderPromptManagerListItems() called');
+			// Let ST render the list first
+			await originalRenderListItems(...args);
+
+			// Now inject our display box at the top of the list
+			const context = await resolveContext();
+			const preferences = Storage.getPreferences();
+			const lock = resolveLock(context, preferences);
+			updateDisplay(null, lock);
+		};
+
+		console.log('CCPM: Hook applied to renderPromptManagerListItems');
+	} else {
+		console.warn('CCPM: promptManager not available at initialization');
+	}
+
 	console.log('CCPM: Extension initialized');
 }
 
 // Register event handlers using new modular architecture
 eventSource.on(event_types.APP_READY, initializeExtension);
 eventSource.on(event_types.CHAT_CHANGED, () => NewEventHandlers.onChatChanged());
+eventSource.on(event_types.SETTINGS_UPDATED, () => NewEventHandlers.onSettingsUpdated());
 if (event_types.OAI_PRESET_CHANGED_AFTER) {
 	eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, () => NewEventHandlers.onPresetChanged());
 }
