@@ -1578,14 +1578,8 @@ async function renderPromptTemplateList() {
 			<div class="text_pole padding10 marginBot10" style="${borderStyle}">
 				<div class="flex-container spaceBetween alignItemsCenter marginBot5">
 					<div class="flexGrow">
-						<div class="fontsize120p">
-							${escapeHtml(t.name)}
-							${lockStatus}
-						</div>
-						<div class="fontsize90p text_muted flex-container flexGap10">
-							<span class="toggleEnabled">${promptCount} prompt${promptCount !== 1 ? 's' : ''}</span>
-							<span>Created: ${createdDate}</span>
-						</div>
+						${escapeHtml(t.name)} <small>(Created: ${createdDate})</small> ${lockStatus}
+						${t.description ? `<div class="text_muted fontsize90p marginBot10">${escapeHtml(t.description)}</div>` : ''}
 					</div>
 					<div class="flex-container flexGap2">
 						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmApplyTemplate('${t.id}')" title="Apply Template" style="width: 32px; height: 32px; padding: 0;">
@@ -1600,16 +1594,13 @@ async function renderPromptTemplateList() {
 						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmEditTemplate('${t.id}')" title="Edit Template Name/Description" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-edit"></i>
 						</div>
+						<div class="menu_button menu_button_icon interactable" onclick="window.ccpmCopyTemplateId('${t.id}')" title="Copy Template ID" style="width: 32px; height: 32px; padding: 0;">
+							<i class="fa-solid fa-copy"></i>
+						</div>
 						<div class="menu_button menu_button_icon interactable redOverlayGlow" onclick="window.ccpmDeleteTemplate('${t.id}')" title="Delete Template" style="width: 32px; height: 32px; padding: 0;">
 							<i class="fa-solid fa-trash"></i>
 						</div>
 					</div>
-				</div>
-				${t.description ? `<div class="text_muted fontsize90p marginBot10">${escapeHtml(t.description)}</div>` : ''}
-				<div class="flex-container flexWrap flexGap5">
-					${Object.keys(t.prompts).map(identifier =>
-						`<span class="fontsize80p padding5 toggleEnabled" style="border-radius: 12px;">${identifier}</span>`
-					).join('')}
 				</div>
 			</div>
 		`;
@@ -1656,6 +1647,27 @@ window.ccpmEditTemplate = async function(id) {
 		return;
 	}
 	await showEditTemplateDialog(template);
+};
+
+window.ccpmCopyTemplateId = async function(id) {
+	try {
+		if (navigator.clipboard && navigator.clipboard.writeText) {
+			await navigator.clipboard.writeText(id);
+		} else {
+			const ta = document.createElement('textarea');
+			ta.value = id;
+			ta.style.position = 'fixed';
+			ta.style.opacity = '0';
+			document.body.appendChild(ta);
+			ta.select();
+			document.execCommand('copy');
+			document.body.removeChild(ta);
+		}
+		toastr.success('Template ID copied to clipboard');
+	} catch (err) {
+		console.error('CCPM: Failed to copy template ID', err);
+		toastr.error('Failed to copy template ID');
+	}
 };
 
 window.ccpmDeleteTemplate = async function(id) {
@@ -1919,6 +1931,7 @@ window.ccpmViewPrompts = async function(templateId) {
 						<li class="ccpm_prompt_manager_prompt ccpm_prompt_draggable ${isMarker ? 'ccpm_prompt_manager_marker' : ''}" data-identifier="${escapeHtml(prompt.identifier)}">
 							<span class="drag-handle">☰</span>
 							<span class="ccpm_prompt_manager_prompt_name">
+								<span class="ccpm-copy-identifier fa-solid fa-copy fa-xs" data-identifier="${escapeHtml(prompt.identifier)}" title="Copy identifier" style="margin-right: 8px; opacity: 0.4; cursor: pointer;"></span>
 								${isMarker ? '<span class="fa-fw fa-solid fa-thumb-tack" title="Marker"></span>' : ''}
 								${!isMarker && isSystemPrompt ? '<span class="fa-fw fa-solid fa-square-poll-horizontal" title="System Prompt"></span>' : ''}
 								${!isMarker && !isSystemPrompt ? '<span class="fa-fw fa-solid fa-asterisk" title="User Prompt"></span>' : ''}
@@ -1928,7 +1941,6 @@ window.ccpmViewPrompts = async function(templateId) {
 								${roleIcon ? `<span data-role="${escapeHtml(prompt.role)}" class="fa-xs fa-solid ${roleIcon}" title="${roleTitle}"></span>` : ''}
 								${isInjectionPrompt ? `<small class="prompt-manager-injection-depth">@ ${escapeHtml(prompt.injection_depth)}</small>` : ''}
 							</span>
-							<span></span>
 							<span class="ccpm_prompt_role">${escapeHtml(prompt.role || 'system')}</span>
 						</li>
 						${!isMarker ? `
@@ -1987,6 +1999,36 @@ ${escapeHtml(prompt.content || '(empty)')}
 					e.stopPropagation();
 					const identifier = btn.dataset.identifier;
 					ccpmEditPromptInTemplate(templateId, identifier);
+				});
+			});
+
+			// Setup click handlers for copying prompt identifiers
+			document.querySelectorAll('.ccpm-copy-identifier').forEach(btn => {
+				btn.addEventListener('click', async (e) => {
+					e.preventDefault();
+					e.stopPropagation();
+					const identifier = btn.dataset.identifier;
+					try {
+						if (window.ccpmCopyToClipboard) {
+							await window.ccpmCopyToClipboard(identifier, 'Prompt identifier copied to clipboard');
+						} else if (navigator.clipboard && navigator.clipboard.writeText) {
+							await navigator.clipboard.writeText(identifier);
+							toastr.success('Prompt identifier copied to clipboard');
+						} else {
+							const ta = document.createElement('textarea');
+							ta.value = identifier;
+							ta.style.position = 'fixed';
+							ta.style.opacity = '0';
+							document.body.appendChild(ta);
+							ta.select();
+							document.execCommand('copy');
+							document.body.removeChild(ta);
+							toastr.success('Prompt identifier copied to clipboard');
+						}
+					} catch (err) {
+						console.error('CCPM: Failed to copy identifier', err);
+						toastr.error('Failed to copy identifier');
+					}
 				});
 			});
 

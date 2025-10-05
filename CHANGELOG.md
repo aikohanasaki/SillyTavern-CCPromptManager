@@ -4,6 +4,15 @@
 
 All notable changes to CCPromptManager will be documented in this file.
 
+## [1.0.5] - 2025-10-04
+
+### Added
+- Template List: Added a “Copy Template ID” quick action between “Edit Template Name/Description” and “Delete Template”.
+- Prompt Viewer: Added a “Copy identifier” icon placed immediately after the drag-handle in each prompt row to copy the prompt’s identifier.
+
+### Changed
+- Minor UI/UX polish around action icons and feedback toasts in the prompt manager.
+
 ## [1.0.4] - 2025-09-30
 
 ### Fixed
